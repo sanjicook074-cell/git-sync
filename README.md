@@ -203,6 +203,7 @@ python scripts/git_sync.py --intro
 | `账号对不上：你给的地址是 A，但这枚令牌属于 B` | 地址与令牌不是同一个账号 | 换成该账号自己的令牌，或改对 `--account`。**这是防误建的保护** |
 | 推送卡住不动 / 弹出凭据选择框 | 系统 git 配了 GUI 凭据助手 | git-sync 已内置规避（清空 credential.helper）；若仍出现，检查自己的 system 级 gitconfig |
 | `Connection was reset` / 连接超时 | 链路干扰，**不是配置错误** | 脚本会自动降级重试。`github.com` 的 HTTP/2 有时会被中断，可试 `git -c http.version=HTTP/1.1` |
+| GitHub 报「已自动试过清代理 / 绑 IP 仍失败」 | ⚠️ 这句话可能**比实情悲观**：早期版本"绑 IP"只试 1 个地址，那个 IP 一挂就整级作废——**并非所有办法都试过了** | 升级到 v1.9.1（会逐个试 DNS + 候选 IP）。**别急着查代理和令牌**——先换个 IP 试，往往一次就通 |
 | 文件太大推不上去 | 超平台配额 | 用 `.gitignore` 排除，或 Git LFS（本工具不支持 LFS） |
 | `git status` 显示 `[gone]` | 推送走显式 URL，git 未建 remote-tracking 引用 | 脚本会自动补；手动可 `git fetch <remote>` |
 | 想推两个平台但只有一个成功 | 两个平台账号名不同，需各给一个 `--account` | 见上方命令速查 |
@@ -226,12 +227,12 @@ python scripts/git_sync.py --intro
 ## 开发：跑测试
 
 ```bash
-python scripts/test_robustness.py     # 56 项：网络降级、refs 核对、远端复用、删除项
+python scripts/test_robustness.py     # 58 项：网络降级、IP 候选、refs 核对、远端复用、删除项
 python scripts/test_wizard.py         # 103 项：四问向导、账号解析、按平台核对、可见性核对
 python scripts/test_repo_create.py    # 53 项：建库 API 契约、可见性纠正
 ```
 
-共 **212 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
+共 **214 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
 测试里插了一根钉子：`main()` 一旦试图访问真实网络就**直接抛异常**——
 避免"漏打一个桩"让测试悄悄降级成假绿。
 
