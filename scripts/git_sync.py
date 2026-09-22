@@ -87,19 +87,32 @@ NO_PROMPT_ENV = {
 # GitHub 才做 IP 兜底。DNS 污染在 GitHub 高发，且 IP 会逐个失效、每次要实测；
 # Gitee / Codeup / 自建 GitLab 没有权威固定 IP 段，硬绑 IP 反而出错，一律走 DNS。
 #
-# ⚠️ 这几个只是**最后**的兜底（本机实测过的老段），优先级低于 DNS。
-# 别再拿它当第一选择：2026-09-23 实测本机 DNS 解析到 20.205.243.166（亚太段），
-# 而写死的这几个是美国段 140.82.11x.4，绑上去只会更慢更不通。见 github_ips()。
-GITHUB_FALLBACK_IPS = ("140.82.114.4", "140.82.116.4", "140.82.112.4")
+# ⚠️ 这几个只是**候选**，不是"正确答案"。IP 会轮换、会失效，**别当成常量依赖**。
+# 排序说明（2026-09-23 03:0x 实测）：
+#   本机 DNS 解析到 20.205.243.166（亚太段），当时**挂住不通**（连接超时无响应）；
+#   同一条链路里 140.82.121.4 **稳定可通（3/3）**，其余几个当时不通。
+#   所以把它排到候选列表前面。但下一次可能又换一个能用——
+#   真遇到全都不通，按 SKILL.md §2 第 23 条的方法现场扫一遍。
+GITHUB_FALLBACK_IPS = (
+    "140.82.121.4", "140.82.112.4", "140.82.113.4", "140.82.114.4",
+    "140.82.116.4", "140.82.116.3", "20.205.243.166", "20.201.28.151",
+)
 
 
-def github_ips(limit=2):
-    """github.com 的候选 IP：**系统 DNS 给什么就用什么**，拿不到才退回写死的备用段。
+def github_ips(limit=4):
+    """github.com 的候选 IP：**DNS 结果在前**，写死的候选段在后，去重后截断。
 
-    顺序很要紧。「绑 IP」这一级的目的是绕开 DNS 污染，所以正常情况下
-    DNS 解析出的地址就是最优解；写死的老段（美国)在本机反而更慢更不通——
-    实测 2026-09-23：DNS → 20.205.243.166（亚太），写死 → 140.82.11x.4。
-    所以 DNS 一旦给出结果，就**不再**叠上备用段去白等一轮超时。
+    顺序的理由：正常情况 DNS 给的就是最优解（绕不开污染时它也没错），
+    所以要**先信 DNS**。但——**只信第一个是不够的**：
+
+    踩过（2026-09-23）：原先这里 `return dns_ips[:1]`，而调用方也只取 1 个 IP，
+    于是"绑 IP"这一级退化成**只有一次机会**。当天 DNS 解析到的
+    20.205.243.166 恰好挂住不通，这一级就跟着一起废掉，脚本报了
+    "已自动试过清代理 / 绑 IP 仍失败"——其实只是**没试第二个 IP**。
+    同链路下 140.82.121.4 是通的。
+
+    所以现在是：DNS 的结果 + 候选段，**去重后给多个**，让调用方逐个试。
+    代价是每个不通的 IP 要白等一次连接超时（约 21 秒），故用 limit 压住总数。
     """
     dns_ips = []
     try:
@@ -109,9 +122,12 @@ def github_ips(limit=2):
                 dns_ips.append(ip)
     except OSError:
         pass
-    if dns_ips:
-        return dns_ips[:limit]
-    return list(GITHUB_FALLBACK_IPS[:limit])
+
+    out = list(dns_ips)
+    for ip in GITHUB_FALLBACK_IPS:
+        if ip not in out:
+            out.append(ip)
+    return out[:limit]
 
 NET_ERROR_HINTS = ("schannel", "handshake", "proxy", "timed out", "timeout",
                    "could not resolve", "unable to access", "failed to connect",
@@ -120,7 +136,7 @@ NET_ERROR_HINTS = ("schannel", "handshake", "proxy", "timed out", "timeout",
 
 # 单次推送超时 / 全部重试的总时长上限（避免网络不通时拖太久）
 PUSH_ATTEMPT_TIMEOUT = 150
-PUSH_TOTAL_BUDGET = 300
+PUSH_TOTAL_BUDGET = 420
 
 
 def net_env(strip_proxy=False):
@@ -1310,12 +1326,15 @@ def push_platform(root, platform, remote, branch, login, repo, token, proto, arg
         ("清代理 + HTTP/1.1", None, True, True),
     ]
     if platform == "github":
-        # 「绑 IP」这一级必须用**当前 DNS 解析出来的**地址，而不是写死的老 IP。
-        # 教训（2026-09-23）：写死的 140.82.11x.4 是美国段，本机实际解析到
-        # 20.205.243.166（亚太段）——绑到老段上等于往一个更远的、多半不通的地址打，
-        # 这一级不但没兜底，还白等一次超时。现在先信 DNS，DNS 拿不到才用备用段。
-        ips = github_ips()[:1]
-        for ip in ips:
+        # 「绑 IP」这一级：**用当前 DNS 解析出的地址打头，再逐个试候选段**。
+        # 教训一（2026-09-23）：写死的 140.82.11x.4 是美国段，本机实际解析到
+        #   20.205.243.166（亚太段）——绑老段等于往更远、多半不通的地址打。
+        #   所以 DNS 结果必须排在前面。
+        # 教训二（同一天稍后）：只试**一个** IP 等于只有一次机会。当天 DNS 给的
+        #   20.205.243.166 恰好挂住，这一级就整级废掉，报"绑 IP 仍失败"——
+        #   其实同链路 140.82.121.4 是通的，但代码从没试它。
+        #   所以现在把候选列表逐个试（个数由 github_ips(limit=4) 压住）。
+        for ip in github_ips():
             attempts.append((f"清代理 + 绑 IP {ip} + HTTP/1.1", ip, True, True))
 
     deadline = time.time() + PUSH_TOTAL_BUDGET

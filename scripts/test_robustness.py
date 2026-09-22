@@ -283,14 +283,19 @@ check("删除项体积为 0（所以必须单独列出）", rep["total_bytes"] =
 
 print()
 print("=" * 60)
-print("9) github_ips —— 「绑 IP」这一级要用 DNS 当前结果，别拿写死的老段硬试")
+print("9) github_ips —— 「绑 IP」这一级：DNS 优先，且必须给多个候选")
 print("=" * 60)
-# 2026-09-23 实测踩到：诊断 GitHub 推不上去时发现，第三级用的是写死的
-# 140.82.11x.4（美国段），而本机 DNS 解析到 20.205.243.166（亚太段）——
-# 绑到老段上不但不兜底，还白等一次超时。
+# 2026-09-23 两次实测踩到的：
+#   ① 写死的 140.82.11x.4（美国段）优先级高于 DNS，而本机解析到
+#      20.205.243.166（亚太段）——绑老段不兜底，还白等一次超时。
+#   ② 改成 DNS 优先后又只剩**一个**候选（dns_ips[:1]），结果当天 DNS 给的
+#      20.205.243.166 恰好挂住不通，整级就废了、报"绑 IP 仍失败"——
+#      同链路 140.82.121.4 明明是通的，只是从没被试到。
+# 现在钉死：DNS 排最前 + 叠上候选段（去重、限量）。
 ips = G.github_ips()
 check("返回非空", bool(ips), str(ips))
-check("默认最多 2 个（总预算不能被无用段吃光）", len(ips) <= 2, str(ips))
+check("候选个数有上限（总预算不能被无用段吃光）", len(ips) <= 4, str(ips))
+check("候选列表无重复", len(ips) == len(set(ips)), str(ips))
 check("反复调用结果稳定（不是随机挑）", G.github_ips() == ips, f"{ips}")
 
 try:
@@ -298,12 +303,12 @@ try:
 except OSError:
     dns = []
 if dns:
-    check("DNS 可用时，候选第一个就是 DNS 解析出的地址", ips[0] in dns, f"{ips} dns={dns}")
-    check("DNS 可用时不掺入写死的老段",
-          all(ip not in G.GITHUB_FALLBACK_IPS for ip in ips), f"{ips}")
+    check("DNS 结果排在最前（正常情况下 DNS 就是最优解）", ips[0] in dns, f"{ips} dns={dns}")
+    check("DNS 之后仍叠上候选段（只试一个 = 只有一次机会）",
+          any(ip in G.GITHUB_FALLBACK_IPS for ip in ips), f"{ips}")
 else:
-    check("DNS 拿不到时退回写死的备用段",
-          ips == list(G.GITHUB_FALLBACK_IPS)[:2], f"{ips}")
+    check("DNS 拿不到时退回候选段",
+          ips == list(G.GITHUB_FALLBACK_IPS)[:len(ips)], f"{ips}")
 
 _real_run, _real_out, _real_sha = G.run, G.git_out, G.read_remote_sha
 cmds = []
@@ -333,6 +338,8 @@ for c in cmds:
 check("网络类错误会一路升级到绑 IP", bool(resolved), str(resolved))
 check("绑的 IP 就是 github_ips() 给的（DNS 优先）",
       resolved == ips[:len(resolved)], f"{resolved} vs {ips}")
+check("绑 IP 这一级会**逐个试多个**（回归：曾只试 1 个，DNS 给的 IP 一挂整级就废）",
+      len(resolved) >= min(2, len(ips)), f"只试了 {resolved}")
 check("绑 IP 用完了也没通就老实返回失败", pushed9 is False, f"{pushed9}")
 
 # HTTP/1.1 兜底：2026-09-23 实测本机到 github.com 的 HTTP/2 被 RST，
