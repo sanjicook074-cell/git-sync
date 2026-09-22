@@ -75,6 +75,7 @@ $ python git_sync.py
   把这个文件夹变成一个 Gitee / GitHub 仓库，然后推上去。
   建仓库、写 .gitignore、提交、推送，都我来——你不用先去网页建一个空库。
   推送前我会先体检：有没有疑似密钥、有没有超限的大文件，有问题先说清楚再动手。
+  推完之后也管：看本地和远端差几个提交、把最新的拉下来、把两个平台对齐。
 
 我需要你提供 4 样东西
   ① 传到哪个账号  ② 该账号的私人令牌  ③ 要上传的文件夹  ④ 仓库叫什么
@@ -120,6 +121,55 @@ AI 会读 `SKILL.md`，按上面的四问跟你确认，然后带参数跑全自
 
 ---
 
+## 用法三：查状态 / 拉取 / 双平台对齐
+
+推是一半，拉是另一半。这三个动作**只读或只增，永远不会 force push**：
+
+```bash
+# 只读：本地和各平台各差几个提交、工作区干不干净、两个平台是否一致
+python scripts/git_sync.py --status
+
+# 拉取远端最新（只做快进；分叉 / 工作区不干净就停下，绝不替你 stash 或合并）
+python scripts/git_sync.py --pull
+
+# 两个平台对不上了？把落后的那一方补上
+python scripts/git_sync.py --align
+
+# 拉完顺手对齐（也可以三个一起用，顺序固定：先拉 → 再对齐 → 最后报状态）
+python scripts/git_sync.py --pull --align
+```
+
+状态长这样：
+
+```
+  本地：main · edeb6e28 · 工作区干净
+
+  gitee   sweetsocks/git-sync-drill           本地落后 1 个提交   edeb6e28
+  github  sanjicook074-cell/git-sync-drill    一致                782822fd
+```
+
+**它怎么看"谁新谁旧"**：只看**合并基是不是祖先**——不看提交数、更不看时间戳。
+所以：
+
+| 情况 | 它会做什么 |
+|---|---|
+| 本地落后（远端有你没有的） | `--pull` 快进；`--align` **拒绝**推（推上去会盖掉远端的新提交） |
+| 本地领先（你有远端没有的） | `--align` 补推；`--pull` 说"没可拉的" |
+| 两边分叉（各有对方没有的） | **两个都停下**，把 merge / rebase 的选择权交回你 |
+| 远端还没这个分支 | `--align` 视为首次推送，可以推 |
+| 工作区有未提交改动 | `--pull` 拒绝拉取，**不会替你 stash、不会丢任何改动** |
+| 平台连不上 | 如实说"查不到"，**不会报成"不一致"** |
+
+退出码（方便脚本判断）：
+
+| 码 | 含义 |
+|---|---|
+| `0` | 一致，无需操作 |
+| `5` | 有差异 / 分叉 / 工作区不干净 —— 需要你决定 |
+| `6` | 平台都拿不到（网络或令牌），状态未知 |
+
+---
+
 ## 拿令牌
 
 **Gitee**：登录 → 右上角头像 → **设置** → 左侧 **私人令牌** → 生成新令牌
@@ -154,6 +204,11 @@ python scripts/git_sync.py --dir ./myproj --platform both --name myproj \
 # 建公开仓库（默认私有）
 python scripts/git_sync.py --dir ./myproj --account <地址> --yes --public
 
+# 同步三件套：查状态 / 拉取 / 双平台对齐
+python scripts/git_sync.py --status
+python scripts/git_sync.py --pull
+python scripts/git_sync.py --align
+
 # 存令牌 / 看配置 / 看自我介绍
 python scripts/git_sync.py --set-token gitee=你的令牌
 python scripts/git_sync.py --show-config
@@ -175,6 +230,9 @@ python scripts/git_sync.py --intro
 | `--yes` | 绝不询问，全自动 |
 | `--proto https\|ssh` | 推送协议，默认 https |
 | `--branch <名>` / `--message <说明>` | 分支名 / 提交信息 |
+| `--status` | 只读：查本地与各平台的差异（退出码 0 / 5 / 6） |
+| `--pull` | 拉取远端最新，**只做快进** |
+| `--align` | 双平台对齐，只补推落后的一方 |
 
 ---
 
@@ -192,6 +250,10 @@ python scripts/git_sync.py --intro
 | 脚本卡住不返回 | 全程关闭交互式提示（`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=Never`、清空 credential.helper），**永不弹窗、永不等待输入** |
 | 网络抖动 | 分级重试：直连 → 清代理 → 绑 IP（仅 GitHub）；**权限类错误立即停**，不盲目重试。唯一例外：**代理会借"认证失败"报错**，所以环境里有代理时这一条不停、继续降级（见下方排查表） |
 | 半截操作 | 提交和推送在最后一步才开始，`Ctrl+C` 退出不会留下半截状态 |
+| 拉取把别人的提交弄丢 | `--pull` **只做快进**，分叉一律停下 |
+| 拉取覆盖你的本地改动 | 工作区只要有未提交改动就**拒绝拉取**，而且**不替你 stash**——那件事必须你自己决定 |
+| 补推把远端的提交盖掉 | `--align` 只推"远端确实是本地祖先"的那一方；对方有本地没有的提交就**拒绝**。全程无 `--force`，一行都没有 |
+| 把"连不上"误看成"不一致" | 状态查询区分「连上了但没这个分支」和「根本连不上」，后者报"状态未知"，不会让你以为代码不同步 |
 
 ---
 
@@ -219,11 +281,12 @@ python scripts/git_sync.py --intro
 
 **做**：`git init`（main 分支）· 生成 `.gitignore` · 调 API 建远端仓库（已存在则复用）·
 写本仓库级 `user.name`/`user.email` · 提交 + 推送（HTTPS 令牌 / SSH）· 推送前体检 ·
-账号归属核对
+账号归属核对 · **快进拉取** · **查同步状态（含双平台是否一致）** · **双平台补推对齐**
 
-**不做**：处理分支合并冲突 · 删仓库或改仓库设置 · 改全局 git 配置 ·
-双向同步（**只推不拉**）· Git LFS · 在组织/公司名下建库（只建到个人账号）·
-替你完成平台实名认证
+**不做**：合并分叉（该 merge 还是 rebase 由你决定）· **force push（一行都没有）** ·
+替你 stash 或丢弃改动 · 处理分支合并冲突 · 删仓库或改仓库设置 · 改全局 git 配置 ·
+按任意分支名推送（用 `--branch` 指定，但一次只处理一个分支）· Git LFS ·
+在组织/公司名下建库（只建到个人账号）· 替你完成平台实名认证
 
 ---
 
@@ -233,9 +296,10 @@ python scripts/git_sync.py --intro
 python scripts/test_robustness.py     # 67 项：网络降级、IP 候选、refs 核对、远端复用、删除项、代理冒充认证失败
 python scripts/test_wizard.py         # 103 项：四问向导、账号解析、按平台核对、可见性核对
 python scripts/test_repo_create.py    # 53 项：建库 API 契约、可见性纠正
+python scripts/test_sync_modes.py     # 60 项：八种同步关系、拉取/对齐的拒绝路径、只读性
 ```
 
-共 **223 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
+共 **283 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
 测试里插了一根钉子：`main()` 一旦试图访问真实网络就**直接抛异常**——
 避免"漏打一个桩"让测试悄悄降级成假绿。
 
@@ -262,7 +326,8 @@ git-sync/
     ├── check_clean.py         分发前敏感信息自查
     ├── test_robustness.py     健壮性测试
     ├── test_wizard.py         向导与取值链路测试
-    └── test_repo_create.py    建库 API 契约测试
+    ├── test_repo_create.py    建库 API 契约测试
+    └── test_sync_modes.py     同步三件套测试（状态/拉取/对齐）
 ```
 
 ---

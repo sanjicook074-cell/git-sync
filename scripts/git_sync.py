@@ -36,13 +36,14 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 
 CONFIG_PATH = Path.home() / ".workbuddy" / "git-sync.json"
 
@@ -807,6 +808,7 @@ def print_intro():
     out("  我能做什么：把这个文件夹变成一个 Gitee / GitHub 仓库，然后推上去。")
     info("建仓库、写 .gitignore、提交、推送，都我来——你不用先去网页建一个空库。")
     info("推送前我会先体检：有没有疑似密钥、有没有超限的大文件，有问题先说清楚再动手。")
+    info("推完之后也管：看本地和远端差几个提交、把最新的拉下来、把两个平台对齐。")
     out()
     out("  我需要你提供 4 样东西：")
     info("① 账号主页地址   例如 https://gitee.com/你的用户名/")
@@ -1426,6 +1428,543 @@ def push_platform(root, platform, remote, branch, login, repo, token, proto, arg
 
 
 # --------------------------------------------------------------------------
+# 同步闭环：状态 / 拉取 / 双平台对齐（v1.12.0）
+# --------------------------------------------------------------------------
+# 为什么补这一块
+# --------------
+# v1.11.0 及以前本工具**只推不拉**（README 里如实写着）。可"同步"的另一半就是拉：
+# 同一个仓库在另一台机器上改过、或在网页上直接编辑过，本地就成了旧的。
+# 三个动作，全部**只读或只增，永不 force push**：
+#   ① --status 只读：本地 vs 各平台各差几个提交、工作区干不干净、两平台是否一致
+#   ② --pull   快进拉取：只在"本地是远端祖先"时动手；分叉就停下交给人
+#   ③ --align  双平台补推：只推**确实是本地祖先**的那一方
+#
+# 共同底线：**判断"谁新谁旧"的唯一依据是"合并基是不是祖先"**，
+# 不是"提交数多"、更不是"时间戳晚"。后两种判断都会毁掉别人的提交。
+
+SYNC_EXIT_IN_SYNC = 0
+SYNC_EXIT_NEEDS_HUMAN = 5      # 有差异 / 分叉 / 工作区不干净 —— 需要你决定
+SYNC_EXIT_UNREACHABLE = 6      # 所有平台都拿不到（网络或令牌）
+
+SYNC_PROBE_BUDGET = 90         # 单个平台探测的总时长上限：查状态不该拖成几分钟
+
+
+def ls_remote_branch(root, prefix, target, branch, env):
+    """问远端这个分支的 SHA。返回 (连通?, sha, err)。
+
+    和 `read_remote_sha` 的关键区别：这里必须**区分**「连不上」和
+    「连上了但远端没有这个分支」。read_remote_sha 两种情况都返回空串——
+    推送场景够用（都算失败），但状态查询分不清就会把"远端还没这个分支"
+    误报成"网络不通"，把排查带偏。
+    """
+    proc = run(prefix + ["ls-remote", target, f"refs/heads/{branch}"],
+               cwd=root, extra_env=env, timeout=60)
+    if proc.returncode != 0:
+        return False, "", (proc.stderr or proc.stdout).strip()
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if parts:
+            return True, parts[0].strip(), ""
+    return True, "", ""
+
+
+def sync_probe_tiers(platform):
+    """状态查询用的降级档位——比推送的阶梯短。
+
+    推送失败你愿意等（数据没上去是大事），但**查个状态等 7 分钟就过分了**，
+    所以 GitHub 的绑 IP 只取 2 个候选。
+    """
+    tiers = [("直连", None, False, False),
+             ("直连 + HTTP/1.1", None, False, True),
+             ("清代理", None, True, False),
+             ("清代理 + HTTP/1.1", None, True, True)]
+    if platform == "github":
+        for ip in github_ips(limit=2):
+            tiers.append((f"清代理 + 绑 IP {ip} + HTTP/1.1", ip, True, True))
+    return tiers
+
+
+def remote_branch_sha(root, platform, target, branch):
+    """探测远端分支 SHA。返回 (连通?, sha, 走哪档通的, err)。"""
+    host = HOSTS[platform]
+    deadline = time.time() + SYNC_PROBE_BUDGET
+    err = ""
+    for label, ip, strip, http1 in sync_probe_tiers(platform):
+        if time.time() > deadline:
+            break
+        reachable, sha, e = ls_remote_branch(
+            root, git_prefix(host, ip, http1), target, branch, net_env(strip))
+        if reachable:
+            return True, sha, label, ""
+        err = e or err
+    return False, "", "", err or "拿不到远端"
+
+
+def fetch_branch(root, platform, target, branch):
+    """把远端分支取回本地——**只写 FETCH_HEAD**，不动工作区、不动本地分支。
+
+    为什么状态查询也要 fetch：算"谁领先几个提交"必须有远端的提交对象，
+    光有 SHA 是数不出来的。fetch 到 FETCH_HEAD 是纯临时文件，
+    比写 refs/remotes/** 副作用更小（本机 git 写那批 ref 还会静默失败，见 §2 第 15 条）。
+    """
+    host = HOSTS[platform]
+    deadline = time.time() + SYNC_PROBE_BUDGET
+    err = ""
+    for _label, ip, strip, http1 in sync_probe_tiers(platform):
+        if time.time() > deadline:
+            break
+        proc = run(git_prefix(host, ip, http1)
+                   + ["fetch", "--no-tags", target, branch],
+                   cwd=root, extra_env=net_env(strip), timeout=90)
+        if proc.returncode == 0:
+            sha = git_out(["rev-parse", "FETCH_HEAD"], root)
+            if sha:
+                return True, sha, ""
+        err = clean_output((proc.stderr or "") + (proc.stdout or "")) or err
+    return False, "", err or "fetch 失败"
+
+
+def detect_remote_targets(root, platforms):
+    """从仓库现有 remote 地址里认出「本平台 + 属主 + 仓库名」。
+
+    比"拿目录名当仓库名"可靠得多：目录名和远端仓库名经常不一样，
+    而且用户可能用 --name 指定过。有远端地址就以地址为准。
+    """
+    found = {}
+    for name in (git(["remote"], cwd=root).stdout or "").split():
+        url = git_out(["remote", "get-url", name], root)
+        for platform in platforms:
+            if HOSTS[platform] not in url:
+                continue
+            tail = url.split("@")[-1].rstrip("/")
+            if tail.endswith(".git"):
+                tail = tail[:-4]
+            seg = [s for s in re.split(r"[/:]", tail) if s]
+            if len(seg) >= 2:
+                found[platform] = {"remote": name, "login": seg[-2],
+                                   "repo": seg[-1]}
+    return found
+
+
+def classify_platform(root, platform, login, repo, token, proto, branch,
+                      local_sha, local_exists):
+    """算出「这个平台的远端」相对本地是什么关系。**全程只读**（fetch 只落 FETCH_HEAD）。
+
+    relation 的语义统一以**本地**为基准：
+      same 一致 / behind 本地落后 / ahead 本地领先 /
+      diverged 分叉 / missing 远端没有这个分支 / local-empty 本地还没提交 /
+      unreachable 拿不到 / unknown 连上了但比不出来
+    """
+    # token 必须一起带出来：--pull / --align 后面要拿它拼带凭据的 URL。
+    # 第一版漏了，cmd_pull 走到 fetch 就 KeyError——被测试当场抓到。
+    res = {"platform": platform, "login": login, "repo": repo, "token": token,
+           "reachable": False, "remote_sha": "", "via": "", "err": "",
+           "relation": "unreachable", "ahead": None, "behind": None}
+    target = (remote_url(platform, login, repo, proto) if proto == "ssh"
+              else auth_url(platform, login, repo, token))
+
+    reachable, sha, via, err = remote_branch_sha(root, platform, target, branch)
+    res.update(reachable=reachable, remote_sha=sha, via=via, err=err)
+    if not reachable:
+        return res
+    if not sha:
+        res["relation"] = "missing"          # 连上了，但远端还没有这个分支
+        return res
+    if not local_exists:
+        res["relation"] = "local-empty"
+        return res
+    if sha == local_sha:
+        res["relation"] = "same"
+        res["ahead"] = res["behind"] = 0
+        return res
+
+    # 到这里两边 SHA 不同，必须数清楚差几个——这需要远端的提交对象在本地
+    fok, fsha, ferr = fetch_branch(root, platform, target, branch)
+    if not fok:
+        res["relation"] = "unknown"
+        res["err"] = f"取不回远端提交对象，无法比较：{ferr}"
+        return res
+
+    proc = git(["rev-list", "--left-right", "--count",
+                f"{fsha}...{branch}"], cwd=root)
+    if proc.returncode != 0:
+        res["relation"] = "unknown"
+        res["err"] = clean_output(proc.stderr) or "无法比较"
+        return res
+    parts = (proc.stdout or "").split()
+    if len(parts) != 2:
+        res["relation"] = "unknown"
+        res["err"] = "比较结果异常"
+        return res
+    # `--left-right --count A...B` 输出「只在 A 里的 / 只在 B 里的」，
+    # A 是远端、B 是本地 —— 所以左数是**本地落后**，右数是**本地领先**。
+    res["behind"], res["ahead"] = int(parts[0]), int(parts[1])
+    if res["behind"] and res["ahead"]:
+        res["relation"] = "diverged"
+    elif res["behind"]:
+        res["relation"] = "behind"
+    elif res["ahead"]:
+        res["relation"] = "ahead"
+    else:
+        res["relation"] = "same"
+    return res
+
+
+REL_LABEL = {
+    "same": "一致",
+    "behind": "本地落后",
+    "ahead": "本地领先",
+    "diverged": "两边分叉",
+    "missing": "远端还没有这个分支",
+    "local-empty": "本地还没有提交",
+    "unreachable": "拿不到远端",
+    "unknown": "无法比较",
+}
+
+
+def rel_text(r):
+    rel = r["relation"]
+    label = REL_LABEL.get(rel, rel)
+    if rel in ("behind", "ahead") and (r["ahead"] or r["behind"]):
+        n = r["behind"] or r["ahead"]
+        return f"{label} {n} 个提交"
+    return label
+
+
+def sync_collect(cfg, args, quiet=False):
+    """同步模式共用的准备：目录、平台、分支、各平台探测结果。
+
+    刻意**不走向导**：向导问的是"传到哪个账号 / 仓库叫什么"，
+    而查状态、拉取、对齐这三件事的答案都在现有仓库和配置里，
+    再问一遍纯属折磨人。
+    """
+    root = Path(args.dir or ".").expanduser().resolve()
+    if not root.is_dir():
+        die(f"目录不存在：{root}")
+    if args.dir is None and not quiet:
+        warn("你没指定 --dir，按当前目录处理。要查别处请加 --dir <项目目录>")
+
+    # 注意：`ensure_git_available()` **不在这里**调。
+    # sync_collect 会被调用多次（拉取后、对齐后各重探一次），
+    # 放这里会把「git version ...」重复打印三四遍——实测就是这么发现的。
+    # 一次性检查统一在 run_sync_modes 里做。
+    if git(["rev-parse", "--git-dir"], cwd=root).returncode != 0:
+        die("这个目录不是 git 仓库（要上传请去掉 --status / --pull / --align）")
+
+    if args.platform:
+        platforms = [p for p in re.split(r"[,\s]+", args.platform.strip()) if p]
+    else:
+        platforms = list(cfg["defaults"].get("platforms") or ["gitee"])
+    platforms = [p.lower() for p in platforms]
+    if "both" in platforms:
+        platforms = list(PLATFORMS)
+    unknown = [p for p in platforms if p not in PLATFORMS]
+    if unknown or not platforms:
+        die(f"平台不合法：{unknown or platforms}，只能是 gitee / github / both")
+
+    proto = args.proto or cfg["defaults"].get("proto", "https")
+    branch = args.branch or current_branch(root) or cfg["defaults"].get("branch", "main")
+    targets = detect_remote_targets(root, platforms)
+    fallback_repo = slugify(args.name or root.name)
+
+    entries, skipped = [], []
+    for platform in platforms:
+        det = targets.get(platform) or {}
+        login = det.get("login") or cfg["logins"].get(platform) or ""
+        repo = det.get("repo") or fallback_repo
+        token = (cfg["tokens"].get(platform)
+                 or os.environ.get(f"{platform.upper()}_TOKEN", ""))
+        if not login and token:
+            login, _err = api_login(platform, token)
+        if not login:
+            skipped.append((platform, "认不出账号：仓库里没有该平台的远端，"
+                                      "配置里也没存账号。先跑一次推送，"
+                                      "或用 --account 指明"))
+            continue
+        if proto == "https" and not token:
+            skipped.append((platform, f"没有 {platform} 令牌，查不了"))
+            continue
+        entries.append({"platform": platform, "login": login, "repo": repo,
+                        "token": token, "remote": det.get("remote", "")})
+
+    local_exists = git(["rev-parse", "--verify", f"refs/heads/{branch}"],
+                       cwd=root).returncode == 0
+    local_sha = (git_out(["rev-parse", f"refs/heads/{branch}"], root)
+                 if local_exists else "")
+    dirty = [l for l in (git_out(["status", "--porcelain"], root) or "").splitlines()
+             if l.strip()]
+
+    results = [classify_platform(root, e["platform"], e["login"], e["repo"],
+                                 e["token"], proto, branch, local_sha, local_exists)
+               for e in entries]
+    for r, e in zip(results, entries):
+        r["remote_name"] = e["remote"]
+
+    # ctx["repo"] 优先用**从远端地址里认出来的真名**，只在认不出来时才退回目录名。
+    # 目录名和远端仓库名经常不一样（drill 目录 → git-sync-drill 仓库），
+    # 拿目录名当仓库名是会出事的（见 align_execute 里那段注释）。
+    detected = {e["repo"] for e in entries}
+    ctx_repo = detected.pop() if len(detected) == 1 else fallback_repo
+
+    return {"root": root, "platforms": platforms, "proto": proto,
+            "branch": branch, "repo": ctx_repo, "targets": targets,
+            "entries": entries, "results": results, "skipped": skipped,
+            "local": {"exists": local_exists, "sha": local_sha, "dirty": dirty}}
+
+
+def short(sha):
+    return (sha or "")[:8] or "(无)"
+
+
+def pad(text, width):
+    """按**显示宽度**右侧补空格。
+
+    为什么不能用 f"{text:<20}"：那数的是**字符数**，而一个汉字占 2 个显示列。
+    "一致"算 2 个字符但占 4 列，表格立刻歪掉——实测第一版就是这样。
+    """
+    w = sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+            for c in text)
+    return text + " " * max(0, width - w)
+
+
+def print_local(ctx):
+    loc = ctx["local"]
+    if not loc["exists"]:
+        info(f"本地：分支 {ctx['branch']} 还不存在（本地还没提交过）")
+        return
+    state = "工作区干净" if not loc["dirty"] else \
+        f"工作区有 {len(loc['dirty'])} 处未提交改动"
+    info(f"本地：{ctx['branch']} · {short(loc['sha'])} · {state}")
+
+
+def print_results(ctx):
+    if not ctx["results"]:
+        warn("没有任何可查的平台（缺账号或缺令牌）")
+    for r in ctx["results"]:
+        detail = short(r["remote_sha"]) if r["reachable"] else (r["err"] or "")[:56]
+        info(pad(r["platform"], 8) + pad(f"{r['login']}/{r['repo']}", 36)
+             + pad(rel_text(r), 20) + detail
+             + (f"  （{r['via']}）" if r["reachable"] and r["via"] != "直连" else ""))
+
+
+def cmd_status(ctx):
+    print_local(ctx)
+    out()
+    print_results(ctx)
+    for platform, why in ctx["skipped"]:
+        warn(f"{platform}：{why}")
+    out()
+
+    if not ctx["results"]:
+        bad("没有任何可查的平台（缺账号或缺令牌）")
+        return SYNC_EXIT_UNREACHABLE
+    unreachable = [r for r in ctx["results"] if not r["reachable"]]
+    if len(unreachable) == len(ctx["results"]):
+        bad("所有平台都拿不到，没法判断同步状态")
+        info("网络或令牌问题，不是「没同步」。先确认能连上平台再重试。")
+        return SYNC_EXIT_UNREACHABLE
+
+    # 「工作区不干净」和「远端不同步」是两件事，分开说——
+    # 混成一句"有差异"，用户不知道下一步该提交还是该拉取。
+    remote_out = [r for r in ctx["results"] if r["relation"] != "same"]
+    dirty = ctx["local"]["dirty"]
+    if not remote_out and not dirty:
+        ok("本地与所有平台一致，工作区干净，无需操作")
+        return SYNC_EXIT_IN_SYNC
+    if not remote_out:
+        warn(f"远端都已一致，但工作区有 {len(dirty)} 处未提交改动")
+        info("提交后再用 --align 推上去（或正常跑一次推送）")
+        return SYNC_EXIT_NEEDS_HUMAN
+
+    warn("远端与本地有差异，见上表")
+    if dirty:
+        info(f"另外工作区还有 {len(dirty)} 处未提交改动")
+    if [r for r in remote_out if r["relation"] == "behind"]:
+        info("本地落后 → 运行 --pull 拉取（只做快进，不会动你的改动）")
+    if [r for r in remote_out if r["relation"] == "ahead"]:
+        info("本地领先 → 运行 --align 把落后的平台补上")
+    if [r for r in remote_out if r["relation"] in ("diverged", "unknown")]:
+        info("分叉或比不出来 → 需要你自己决定 merge / rebase，本工具不替你选")
+    if unreachable:
+        info(f"还有 {len(unreachable)} 个平台拿不到，它的状态未知（不是「不一致」）")
+    return SYNC_EXIT_NEEDS_HUMAN
+
+
+def cmd_pull(ctx):
+    head("拉取远端最新（只做快进，永不合并分叉）")
+    loc = ctx["local"]
+    if not loc["exists"]:
+        bad("本地还没有任何提交，没有可拉取的目标")
+        info("先把本地推上去：去掉 --pull 直接运行本脚本")
+        return SYNC_EXIT_NEEDS_HUMAN
+    if loc["dirty"]:
+        bad(f"工作区有 {len(loc['dirty'])} 处未提交改动，为安全起见不拉取")
+        info("先提交或 stash 你自己的改动再重跑。")
+        info("**本工具不会替你 stash、也不会丢弃任何改动**——那件事必须你自己决定。")
+        return SYNC_EXIT_NEEDS_HUMAN
+
+    behind = [r for r in ctx["results"] if r["relation"] == "behind"]
+    diverged = [r for r in ctx["results"] if r["relation"] == "diverged"]
+    ahead = [r for r in ctx["results"] if r["relation"] == "ahead"]
+    if not behind and not diverged:
+        if ahead:
+            ok("本地已经是最新的（本地领先远端，没有可拉的东西）")
+            info("要推上去：运行 --align，或去掉 --pull 正常推送一次")
+        else:
+            ok("本地已是最新")
+        return SYNC_EXIT_IN_SYNC
+
+    if not behind and diverged:
+        bad("两边各有对方没有的提交（分叉），不能自动快进")
+        for r in diverged:
+            info(f"{r['platform']}：本地领先 {r['ahead']} 个 / 落后 {r['behind']} 个提交")
+        info("该 merge 还是该 rebase 是你的决定，本工具不替你选。")
+        info("处理完再跑 --status 确认。")
+        return SYNC_EXIT_NEEDS_HUMAN
+
+    pick = behind[0]
+    others = [r for r in behind[1:]]
+    info(f"从 {pick['platform']} 拉取 {ctx['branch']}（本地落后 {pick['behind']} 个提交）")
+    target = (remote_url(pick["platform"], pick["login"], pick["repo"], ctx["proto"])
+              if ctx["proto"] == "ssh"
+              else auth_url(pick["platform"], pick["login"], pick["repo"], pick["token"]))
+    before = loc["sha"]
+    fok, fsha, ferr = fetch_branch(ctx["root"], pick["platform"], target, ctx["branch"])
+    if not fok:
+        bad(f"拉取失败：{ferr}")
+        return SYNC_EXIT_UNREACHABLE
+    if fsha == loc["sha"]:
+        ok("远端与本地已经一致（拉取时被更新过）")
+        return SYNC_EXIT_IN_SYNC
+
+    proc = git(["merge", "--ff-only", fsha], cwd=ctx["root"])
+    if proc.returncode != 0:
+        bad("快进失败——远端和本地已经分叉，没有动你的任何东西")
+        info(clean_output((proc.stderr or proc.stdout))[:300])
+        info("该 merge 还是该 rebase 由你决定，本工具不替你选。")
+        return SYNC_EXIT_NEEDS_HUMAN
+    after = git_out(["rev-parse", f"refs/heads/{ctx['branch']}"], ctx["root"])
+    if after != fsha:
+        bad(f"合并后本地 HEAD（{short(after)}）与预期（{short(fsha)}）不符")
+        return SYNC_EXIT_NEEDS_HUMAN
+    ok(f"已快进 {short(before)} → {short(after)}（{pick['behind']} 个提交）")
+    info("只更新了当前分支，工作区未提交的改动没有被碰（本来也没有）")
+
+    for r in others + diverged:
+        warn(f"{r['platform']}：{rel_text(r)}——已拉取的那个平台可能不是最新的，"
+             f"跑 --status 看清后再决定")
+    return SYNC_EXIT_IN_SYNC
+
+
+def cmd_align(ctx):
+    head("双平台对齐（只补推落后的那一方）")
+    loc = ctx["local"]
+    if not loc["exists"]:
+        bad("本地还没有提交，没有可推的内容")
+        return SYNC_EXIT_NEEDS_HUMAN
+
+    pushable, refused, same = [], [], []
+    for r in ctx["results"]:
+        rel = r["relation"]
+        if rel == "same":
+            same.append(r)
+        elif rel in ("ahead", "missing"):
+            pushable.append(r)
+        elif rel == "behind":
+            refused.append((r, "那个平台上有本地还没有的提交"))
+        elif rel == "diverged":
+            refused.append((r, "两边各有对方没有的提交（分叉）"))
+        else:
+            refused.append((r, f"拿不到远端：{(r['err'] or '')[:80]}"))
+
+    for r in same:
+        ok(f"{r['platform']} 已一致（{short(r['remote_sha'])}），不用推")
+
+    if refused:
+        out()
+        bad("以下平台**拒绝补推**——它们上面有本地没有的东西，强推就会丢掉")
+        for r, why in refused:
+            info(f"{r['platform']}：{why}")
+        info("先 `--pull` 把远端提交拉下来合并，再回来 --align。")
+        info("**本工具永远不 force push**：判断依据是「合并基是不是祖先」，")
+        info("不是「谁的提交多」或「谁的时间戳晚」——后两种都会毁掉别人的提交。")
+
+    if not pushable:
+        if not refused:
+            ok("所有平台都与本地一致")
+        return (SYNC_EXIT_IN_SYNC if not refused else SYNC_EXIT_NEEDS_HUMAN), []
+
+    out()
+    for r in pushable:
+        what = "远端还没有这个分支，将首次推送" if r["relation"] == "missing" \
+            else f"本地领先 {r['ahead']} 个提交"
+        info(f"{r['platform']}：{what} → 补推")
+    # 判断与执行分开：判断部分纯只读、可测试；执行部分才动远端。
+    return SYNC_EXIT_IN_SYNC, pushable
+
+
+def run_sync_modes(cfg, args):
+    """--status / --pull / --align 的入口。顺序：先拉 → 再对齐 → 最后报状态。"""
+    head("git-sync —— 同步（状态 / 拉取 / 对齐）")
+    ensure_git_available()          # 只检查一次，别放进会被反复调用的 sync_collect
+    ctx = sync_collect(cfg, args)
+    info(f"项目目录：{ctx['root']}")
+    info(f"模式：{'拉取 ' if args.pull else ''}{'对齐 ' if args.align else ''}"
+         f"{'状态' if args.status or not (args.pull or args.align) else ''}".strip())
+    out()
+
+    code = SYNC_EXIT_IN_SYNC
+    if args.pull:
+        code = max(code, cmd_pull(ctx))
+        ctx = sync_collect(cfg, args, quiet=True)      # 拉完重新探一遍
+    if args.align:
+        align_code, push_list = cmd_align(ctx)
+        code = max(code, align_code)
+        if push_list:
+            code = max(code, align_execute(cfg, args, ctx, push_list))
+        ctx = sync_collect(cfg, args, quiet=True)
+    # 最后**一定**报一次状态：刚拉完/刚对齐完，用户最想知道的恰恰是
+    # "现在到底同没同步"。为此多探一轮网络是值得的——
+    # （第一版只在 --status 时才报，于是 `--pull` 跑完什么都不显示，像没说清楚。）
+    head("同步状态" + ("（操作后）" if (args.pull or args.align) else ""))
+    code = max(code, cmd_status(ctx))
+    return code
+
+
+def align_execute(cfg, args, ctx, push_list):
+    """真正执行补推。拆出来是为了让 cmd_align 的判断部分保持纯只读、可测试。"""
+    for r in push_list:
+        cfg["logins"][r["platform"]] = r["login"]
+    code = SYNC_EXIT_IN_SYNC
+    for r in push_list:
+        platform = r["platform"]
+        # ⚠️ 每个平台必须用**自己那个仓库名**去匹配远端地址，不能用全局的一个。
+        # 真踩过（2026-09-23 演练）：这里原先用 ctx["repo"]，而它是**目录名**——
+        # 目录 drill 对应的远端仓库叫 git-sync-drill，地址匹配不上，
+        # 于是凭空新建了一个指向 `.../drill.git` 的 `github-remote`。
+        # 更阴的是：**推送本身是对的**（push_platform 用的是 r["repo"] 拼的显式 URL），
+        # 所以屏幕上显示"补推成功"，只有一个 `[OK] 远端 github-remote → .../drill.git`
+        # 露了马脚。结果是推对了、remote 配错了，还把 branch.main.remote 指歪了。
+        cfg["_repo"] = r["repo"]
+        plan = resolve_remotes(ctx["root"], [platform], ctx["proto"], cfg, args)
+        remote_name = (plan[0][1] if plan else "") or r.get("remote_name") or "origin"
+        pushed, err, via, note = push_platform(
+            ctx["root"], platform, remote_name, ctx["branch"], r["login"],
+            r["repo"], r["token"], ctx["proto"], args)
+        if pushed:
+            ok(f"{platform} 补推成功（{via}）")
+            if note:
+                warn(note)
+        else:
+            bad(f"{platform} 补推失败")
+            info(err.replace("\n", "\n         ")[:600])
+            code = max(code, SYNC_EXIT_NEEDS_HUMAN)
+    if len(push_list) > 1 and code == SYNC_EXIT_IN_SYNC:
+        ok("两个平台已对齐")
+    return code
+
+
+# --------------------------------------------------------------------------
 # 配置展示
 # --------------------------------------------------------------------------
 def print_config(cfg):
@@ -1492,6 +2031,13 @@ def build_parser():
     ap.add_argument("--show-config", action="store_true", help="打印当前配置")
     ap.add_argument("--intro", action="store_true",
                     help="打印「我能做什么 / 需要你提供什么」的介绍后退出")
+    ap.add_argument("--status", action="store_true",
+                    help="只读：看本地与各平台各差几个提交、两平台是否一致")
+    ap.add_argument("--pull", action="store_true",
+                    help="拉取远端最新（只做快进；分叉或工作区不干净就停下，"
+                         "不会替你 stash 或合并）")
+    ap.add_argument("--align", action="store_true",
+                    help="双平台补推：只推确实落后的一方，永不 force push")
     ap.add_argument("--version", action="version", version=f"git-sync {VERSION}")
     return ap
 
@@ -1542,6 +2088,13 @@ def main():
     if args.intro:
         print_intro()
         return
+
+    # ---- 同步模式（--status / --pull / --align）----
+    # 这三个跟"从零建库并推送"是两码事：目标目录、平台、账号、仓库名全都
+    # 能从**现有仓库的 remote 地址 + 配置**里推出来，所以**不走向导**——
+    # 向导要问的"传到哪个账号 / 仓库叫什么"，对查状态和拉取纯属折磨人。
+    if args.status or args.pull or args.align:
+        sys.exit(run_sync_modes(cfg, args))
 
     # ---- 账号地址（--account 或向导第①问）----
     # 按平台存期望值。两个平台的账号名常常不一样（实测用户就是 zhangsan / lisi），
