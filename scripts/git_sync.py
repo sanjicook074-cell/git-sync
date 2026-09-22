@@ -42,7 +42,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "1.10.1"
+VERSION = "1.11.0"
 
 CONFIG_PATH = Path.home() / ".workbuddy" / "git-sync.json"
 
@@ -158,6 +158,32 @@ def clean_output(text):
 def is_network_error(text):
     low = (text or "").lower()
     return any(hint in low for hint in NET_ERROR_HINTS)
+
+
+# `fatal: Authentication failed for 'https://...'` 这条太容易被当成"令牌没权限"。
+# 但**代理拒绝 CONNECT（407/502）时，git 会把 URL 里带的凭据拿去当「代理」凭据试一遍**，
+# 被拒后照样打印这句。
+# 2026-09-23 实测坐实：本地代理回 `CONNECT tunnel failed, response 502`，
+# git 报 `Authentication failed`；而同一枚令牌几分钟前刚成功 PATCH 过 api.github.com。
+# 后果很严重：它被当成"权限类错误 → 立即停"，**降级阶梯在第 1 级就断了**，
+# 永远走不到"清代理"那一级——而那一级恰恰是能用的。
+AUTH_ERROR_HINTS = ("authentication failed", "bad credentials", "unauthorized",
+                    "permission denied", "access denied", "not authorized",
+                    "invalid username or password", "incorrect username or password")
+
+
+def is_auth_error(text):
+    low = (text or "").lower()
+    return any(hint in low for hint in AUTH_ERROR_HINTS)
+
+
+def has_proxy_env():
+    """环境里当前有没有代理配置。
+
+    只有**有代理**时，"这条 Authentication failed 其实是代理"才成立；
+    没配代理还报认证失败，那就是真的凭据问题，该停就停。
+    """
+    return any(os.environ.get(var) for var in PROXY_VARS)
 
 
 def git_prefix(host, ip=None, http1=False):
@@ -1339,6 +1365,7 @@ def push_platform(root, platform, remote, branch, login, repo, token, proto, arg
 
     deadline = time.time() + PUSH_TOTAL_BUDGET
     last_err = ""
+    auth_suspect = False          # 见过"可能是代理冒充的"认证失败
     for label, ip, strip_proxy, http1 in attempts:
         if time.time() > deadline:
             last_err = (last_err or "网络不通") + f"\n（重试总时长已超过 {PUSH_TOTAL_BUDGET} 秒，停止升级）"
@@ -1381,8 +1408,20 @@ def push_platform(root, platform, remote, branch, login, repo, token, proto, arg
             return True, "", label, note
 
         last_err = output or "未收到远端响应"
-        if not is_network_error(last_err):
-            break
+        if is_network_error(last_err):
+            continue
+        # 「权限类错误立即停」这条规矩有个例外，实测踩出来的：
+        # 代理在拒绝 CONNECT 时会把认证失败"借"给 git，看着像令牌没权限。
+        # 此时不能停——后面几级会把代理摘掉，代理一摘真相就出来了。
+        if is_auth_error(last_err) and has_proxy_env():
+            auth_suspect = True
+            continue
+        break
+
+    if auth_suspect and last_err:
+        last_err += ("\n（注意：上面这条「认证失败」可能是**代理冒充的**——"
+                     "本机代理在拒绝 CONNECT 时 git 会这么报。已继续试过后续级别。"
+                     "若最后仍失败，先看代理是不是挂了/要认证，别急着换令牌。）")
     return False, last_err, "", ""
 
 

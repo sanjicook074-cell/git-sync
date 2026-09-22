@@ -355,6 +355,86 @@ check("git_prefix(http1=True) 确实带上该参数",
 check("git_prefix 默认不带（不改变原有行为）",
       "http.version=HTTP/1.1" not in G.git_prefix("github.com"), "")
 
+# ---------------------------------------------------------------------------
+# §10 代理冒充「认证失败」——降级阶梯不能被假权限错误一级断死
+# ---------------------------------------------------------------------------
+# 2026-09-23 实测：本地代理回 `CONNECT tunnel failed, response 502`，
+# git 却打印 `fatal: Authentication failed for 'https://github.com/...'`。
+# 原因是**代理拒绝 CONNECT 时，git 会把 URL 里带的凭据拿去当「代理」凭据试**，
+# 被拒后报的就是这句。
+# 而"权限类错误立即停"这条规矩会把它当成"令牌没权限"→
+# **阶梯在第 1 级就断，永远走不到「清代理」那一级**——那一级才是能用的。
+AUTH_STDERR = ("fatal: Authentication failed for "
+               "'https://github.com/lisi/expotool.git/'")
+check("这条原话会被认成认证类错误", G.is_auth_error(AUTH_STDERR), AUTH_STDERR)
+check("它不属于网络类错误（这正是被误判成权限问题的原因）",
+      not G.is_network_error(AUTH_STDERR), "")
+
+
+def run_push_with(stderr, install_proxy):
+    """跑一次 push_platform，返回 (成功?, 错误文本, 发起的命令列表)。"""
+    saved_env = {v: os.environ.get(v) for v in G.PROXY_VARS}
+    _r, _o, _s, _ips = G.run, G.git_out, G.read_remote_sha, G.github_ips
+    issued = []
+    try:
+        for v in G.PROXY_VARS:
+            os.environ.pop(v, None)
+        if install_proxy:
+            os.environ["https_proxy"] = "http://127.0.0.1:7890"
+
+        def fake_run(cmd, **kw):
+            issued.append(list(cmd))
+            return SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+
+        G.run = fake_run
+        G.read_remote_sha = lambda *a, **k: ("", "boom")
+        G.git_out = lambda *a, **k: "a" * 40
+        # 钉死候选 IP，测试不打 DNS
+        G.github_ips = lambda *a, **k: ["192.0.2.1", "192.0.2.2"]
+        ok, err, _, _ = G.push_platform(
+            repo3, "github", "mirror", "main", "lisi", "expotool", "tok",
+            "https", SimpleNamespace(remember_credentials=False))
+        return ok, err, issued
+    finally:
+        G.run, G.git_out, G.read_remote_sha, G.github_ips = _r, _o, _s, _ips
+        for v in G.PROXY_VARS:
+            os.environ.pop(v, None)
+        for v, val in saved_env.items():
+            if val is not None:
+                os.environ[v] = val
+
+
+ok_px, err_px, cmds_px = run_push_with(AUTH_STDERR, install_proxy=True)
+ips_px = [str(x) for c in cmds_px for x in c
+          if str(x).startswith("http.curloptResolve=")]
+check("有代理时：认证失败**不再一级断死**，会继续升到绑 IP 那一级",
+      bool(ips_px), f"只跑了 {len(cmds_px)} 级：{[str(c[0:3]) for c in cmds_px]}")
+check("有代理时：结论仍是失败（继续试 ≠ 假装成功）", ok_px is False, f"{ok_px}")
+check("有代理时：错误里必须说清「这条认证失败可能是代理冒充的」",
+      "代理" in err_px and "冒充" in err_px, err_px[-90:])
+
+ok_np, err_np, cmds_np = run_push_with(AUTH_STDERR, install_proxy=False)
+check("没配代理时：认证失败仍是权限问题，立即停（不盲目重试）",
+      len(cmds_np) == 1, f"跑了 {len(cmds_np)} 级")
+check("没配代理时：不硬塞「代理冒充」这条解释（减少误报）",
+      "冒充" not in err_np, err_np[-60:])
+# 这条断言第一版写错了：我默认了"环境里没代理"。实际本机**本来就配着代理**
+# （不然也不需要"清代理"这一级），于是还原环境后判定为真、测试红了。
+# 正确写法是先显式清干净再断言，别依赖宿主环境。
+_saved_proxy = {v: os.environ.get(v) for v in G.PROXY_VARS}
+for v in G.PROXY_VARS:
+    os.environ.pop(v, None)
+check("清掉所有代理变量后 has_proxy_env() 为假（依据是环境，不是缓存）",
+      G.has_proxy_env() is False, "")
+os.environ["https_proxy"] = "http://127.0.0.1:7890"
+check("set 一个代理变量后 has_proxy_env() 立刻为真",
+      G.has_proxy_env() is True, "")
+for v in G.PROXY_VARS:
+    os.environ.pop(v, None)
+for v, val in _saved_proxy.items():
+    if val is not None:
+        os.environ[v] = val
+
 print()
 print("=" * 60)
 print(f"结果：{len(passed)} 通过 / {len(failed)} 失败")

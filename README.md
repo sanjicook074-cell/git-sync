@@ -190,7 +190,7 @@ python scripts/git_sync.py --intro
 | 可见性没生效 | **不采信建库接口的返回**——建完读回来核对，不一致就用 PATCH 补正（Gitee 的建库接口会静默忽略可见性参数，实测 5 种写法全无效） |
 | 擅自改动已有仓库 | 只纠正**本次刚建出来**的仓库。已存在的仓库**绝不改设置**，只报告差异 |
 | 脚本卡住不返回 | 全程关闭交互式提示（`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=Never`、清空 credential.helper），**永不弹窗、永不等待输入** |
-| 网络抖动 | 分级重试：直连 → 清代理 → 绑 IP（仅 GitHub）；**权限类错误立即停**，不盲目重试 |
+| 网络抖动 | 分级重试：直连 → 清代理 → 绑 IP（仅 GitHub）；**权限类错误立即停**，不盲目重试。唯一例外：**代理会借"认证失败"报错**，所以环境里有代理时这一条不停、继续降级（见下方排查表） |
 | 半截操作 | 提交和推送在最后一步才开始，`Ctrl+C` 退出不会留下半截状态 |
 
 ---
@@ -206,6 +206,7 @@ python scripts/git_sync.py --intro
 | 推送卡住不动 / 弹出凭据选择框 | 系统 git 配了 GUI 凭据助手 | git-sync 已内置规避（清空 credential.helper）；若仍出现，检查自己的 system 级 gitconfig |
 | `Connection was reset` / 连接超时 | 链路干扰，**不是配置错误** | 脚本会自动降级重试。`github.com` 的 HTTP/2 有时会被中断，可试 `git -c http.version=HTTP/1.1` |
 | GitHub 报「已自动试过清代理 / 绑 IP 仍失败」 | ⚠️ 这句话可能**比实情悲观**：早期版本"绑 IP"只试 1 个地址，那个 IP 一挂就整级作废——**并非所有办法都试过了** | 升级到 v1.9.1（会逐个试 DNS + 候选 IP）。**别急着查代理和令牌**——先换个 IP 试，往往一次就通 |
+| 报 `Authentication failed`，可令牌明明是对的（刚用它调过 API） | ⚠️ **可能是代理冒充的**：代理拒绝 CONNECT 时，git 会把 URL 里的凭据当**代理**凭据试，失败后借"认证失败"来报。老版本会把它当权限问题，**掉头就停**，后面的自救级别一个都不试 | 升级到 v1.11.0。自诊：看直连那次的报错里有没有 `CONNECT tunnel failed`；或临时 `unset https_proxy` 再推。**先查代理，别急着换令牌** |
 | 文件太大推不上去 | 超平台配额 | 用 `.gitignore` 排除，或 Git LFS（本工具不支持 LFS） |
 | `git status` 显示 `[gone]` | 推送走显式 URL，git 未建 remote-tracking 引用 | 脚本会自动补；手动可 `git fetch <remote>` |
 | 想推两个平台但只有一个成功 | 两个平台账号名不同，需各给一个 `--account` | 见上方命令速查 |
@@ -229,12 +230,12 @@ python scripts/git_sync.py --intro
 ## 开发：跑测试
 
 ```bash
-python scripts/test_robustness.py     # 58 项：网络降级、IP 候选、refs 核对、远端复用、删除项
+python scripts/test_robustness.py     # 67 项：网络降级、IP 候选、refs 核对、远端复用、删除项、代理冒充认证失败
 python scripts/test_wizard.py         # 103 项：四问向导、账号解析、按平台核对、可见性核对
 python scripts/test_repo_create.py    # 53 项：建库 API 契约、可见性纠正
 ```
 
-共 **214 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
+共 **223 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
 测试里插了一根钉子：`main()` 一旦试图访问真实网络就**直接抛异常**——
 避免"漏打一个桩"让测试悄悄降级成假绿。
 
