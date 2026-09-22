@@ -185,6 +185,93 @@ check("无法归类 -> 返回空（不瞎猜）", h == [], f"{h}")
 
 print()
 print("=" * 64)
+print("8) 建库可见性核对（Gitee 静默忽略 private → 必须读回来核对 + PATCH 纠正）")
+print("=" * 64)
+print("  背景：实测 Gitee 建库接口无视 private（5 种写法全建成私有，且返回 201）。")
+print("  所以「建完读回来核对」是唯一可靠路径，这一节就是在钉死它。")
+
+
+def fresh(rules):
+    REQUESTS.clear()
+    G.http_json = FakeResponse(rules)
+    return REQUESTS
+
+
+def is_get_repo(u, m):
+    return m == "GET" and "/repos/alice/demo" in u
+
+
+def is_patch_repo(u, m):
+    return m == "PATCH" and u.split("?")[0].endswith("/repos/alice/demo")
+
+
+# --- 8a 请求公开、建出来是私有 -> 必须自动 PATCH 成公开 ---
+rq = fresh([
+    (is_get_repo, (200, {"full_name": "alice/demo", "private": True}, "")),
+    (is_patch_repo, (200, {"full_name": "alice/demo", "private": False}, "")),
+])
+okf, notes = G.align_visibility("gitee", "alice", "demo", "T", False, is_new=True)
+check("8a 建出来是私有、请求公开 -> 判定为已纠正", okf is True, f"{okf} {notes}")
+patches = [r for r in REQUESTS if r["method"] == "PATCH"]
+check("8a 确实发了 PATCH", len(patches) == 1, f"{len(patches)} 次")
+if patches:
+    f = patches[0]["form"] or {}
+    check("8a PATCH 用 form 传 access_token", f.get("access_token") == "T", f"{f}")
+    check("8a PATCH **必须带 name**（否则 Gitee 报 name is missing）",
+          f.get("name") == "demo", f"{f}")
+    check("8a PATCH **必须带 path**（同上）", f.get("path") == "demo", f"{f}")
+    check("8a PATCH 把 private 传成 false", f.get("private") is False, f"{f}")
+check("8a 提示里说明了「Gitee 会忽略该参数」",
+      any("忽略" in n for n in notes), f"{notes}")
+
+# --- 8b 请求私有、建出来就是私有 -> 不该发多余 PATCH ---
+rq = fresh([(is_get_repo, (200, {"private": True}, ""))])
+okf, notes = G.align_visibility("gitee", "alice", "demo", "T", True, is_new=True)
+check("8b 可见性本来就对 -> 判定一致", okf is True, f"{okf}")
+check("8b 不浪费请求：没有发 PATCH",
+      not [r for r in REQUESTS if r["method"] == "PATCH"], f"{[r['method'] for r in REQUESTS]}")
+check("8b 不啰嗦：没有多余提示", notes == [], f"{notes}")
+
+# --- 8c 已存在的仓库可见性不符 -> 只报告，绝不擅自改 ---
+rq = fresh([(is_get_repo, (200, {"private": True}, ""))])
+okf, notes = G.align_visibility("gitee", "alice", "demo", "T", False, is_new=False)
+check("8c 已存在的仓库：不发 PATCH（改别人的设置是大错）",
+      not [r for r in REQUESTS if r["method"] == "PATCH"], f"{[r['method'] for r in REQUESTS]}")
+check("8c 但会报告差异", any("已存在" in n and "私有" in n for n in notes), f"{notes}")
+check("8c 说明白「不改动已存在的仓库设置」",
+      any("不改动" in n for n in notes), f"{notes}")
+
+# --- 8d 读不回来 -> 不猜、不发 PATCH、明确说读不到 ---
+rq = fresh([(is_get_repo, (404, {"message": "Not Found"}, ""))])
+okf, notes = G.align_visibility("gitee", "alice", "demo", "T", False, is_new=True)
+check("8d 读不到可见性 -> 返回 False（不假装成功）", okf is False, f"{okf}")
+check("8d 读不到时不发 PATCH", not [r for r in REQUESTS if r["method"] == "PATCH"])
+check("8d 明确说「读不到」而不是静默", any("读不到" in n for n in notes), f"{notes}")
+
+# --- 8e GitHub 走 JSON body，不是 form ---
+rq = fresh([
+    (is_get_repo, (200, {"private": True}, "")),
+    (is_patch_repo, (200, {"private": False}, "")),
+])
+G.align_visibility("github", "alice", "demo", "ghp_T", False, is_new=True)
+patch = [r for r in REQUESTS if r["method"] == "PATCH"][0]
+check("8e GitHub 的 PATCH 走 JSON body", patch["body"] == {"private": False}, f"{patch['body']}")
+check("8e GitHub 的 PATCH 不带 form", patch["form"] is None, f"{patch['form']}")
+check("8e GitHub 的 PATCH 带 Bearer 令牌", bool(patch["token"]), f"{patch['token']!r}")
+
+# --- 8f 纠正失败：要求私有却留成公开 -> 必须吼一声 ---
+rq = fresh([
+    (is_get_repo, (200, {"private": False}, "")),
+    (is_patch_repo, (500, {"message": "boom"}, "boom")),
+])
+okf, notes = G.align_visibility("gitee", "alice", "demo", "T", True, is_new=True)
+check("8f 纠正失败 -> 返回 False", okf is False, f"{okf}")
+check("8f 报出失败原因", any("改成私有失败" in n for n in notes), f"{notes}")
+check("8f **要求私有却仍是公开 -> 明确警示**",
+      any("公开" in n and n.startswith("⚠️") for n in notes), f"{notes}")
+
+print()
+print("=" * 64)
 print(f"结果：{len(passed)} 通过 / {len(failed)} 失败")
 for f in failed:
     print("   FAIL:", f)

@@ -42,7 +42,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 CONFIG_PATH = Path.home() / ".workbuddy" / "git-sync.json"
 
@@ -453,6 +453,12 @@ def api_login(platform, token):
 
 
 def api_create_repo(platform, token, name, private, description):
+    """建远端仓库。返回 (成功?, 是否新建, 错误)。
+
+    ⚠️ **不要相信这一步返回的可见性。** Gitee 的建库接口会**静默忽略**
+    `private` 参数（实测 5 种写法全部建成私有，且返回 201 成功）。
+    可见性必须建完之后**读回来核对**，交给 `align_visibility()` 处理。
+    """
     if platform == "gitee":
         status, payload, raw = http_json(
             "https://gitee.com/api/v5/user/repos", method="POST",
@@ -474,6 +480,98 @@ def api_create_repo(platform, token, name, private, description):
     if already:
         return True, False, ""
     return False, False, f"HTTP {status}: {message}"
+
+
+def repo_visibility(platform, owner, repo, token):
+    """读回仓库当前的可见性：返回 (private: bool|None, err)。
+
+    `None` 表示没读到（网络/权限问题），调用方**不要**把它当成 False
+    —— "没读出来" 和 "读出来是公开" 是两件事，混淆会导致误判。
+    """
+    if platform == "gitee":
+        status, payload, raw = http_json(
+            f"https://gitee.com/api/v5/repos/{owner}/{repo}"
+            f"?access_token={urlparse.quote(token)}")
+    else:
+        status, payload, raw = http_json(
+            f"https://api.github.com/repos/{owner}/{repo}", token=token)
+    if status == 200 and isinstance(payload, dict) and "private" in payload:
+        return bool(payload["private"]), ""
+    return None, f"HTTP {status}: {flatten_error(payload, raw)}"
+
+
+def api_set_visibility(platform, owner, repo, token, private):
+    """把**已存在**仓库的可见性改成 private 指定的值。返回 (成功?, 错误)。
+
+    **为什么必须有这个函数**（2026-09-23 实测，代价是一个错发可见性的仓库）：
+
+    Gitee 的**建库接口完全无视 `private` 参数**。实测 5 种写法——
+    不带该参数 / `False` / `"false"` / `True` / `"true"`——**一律建成私有**
+    （该账号默认私有）。所以 `--public` 在 Gitee 上不是"偶发失败"，而是
+    **结构性失效**：你请求公开，拿到私有，而接口还**返回 201 成功**，
+    从返回值上完全看不出异常。前面几轮没暴露，是因为一直用的默认（私有），
+    从没在这台机器上真跑过 `--public`。
+
+    唯一可靠的路径是**建库之后再 PATCH 一次**。两个坑都实测过：
+      - Gitee 的 PATCH **必须带 `name` 和 `path`**，否则 400
+        `{'messages': ['name is missing']}`；
+      - Gitee 的 PATCH 不带 `private` 时不会改变可见性，所以要显式传。
+    GitHub 没有这个问题（JSON body 里的布尔值正常生效），但走同一入口，
+    免得两条路径各写一套。
+    """
+    if platform == "gitee":
+        status, payload, raw = http_json(
+            f"https://gitee.com/api/v5/repos/{owner}/{repo}", method="PATCH",
+            form={"access_token": token, "name": repo, "path": repo,
+                  "private": private})
+    else:
+        status, payload, raw = http_json(
+            f"https://api.github.com/repos/{owner}/{repo}", method="PATCH",
+            token=token, body={"private": bool(private)})
+    if status == 200:
+        return True, ""
+    return False, f"HTTP {status}: {flatten_error(payload, raw)}"
+
+
+def align_visibility(platform, owner, repo, token, private, is_new):
+    """确保仓库可见性与用户要求一致。返回 (是否已确认一致, 提示语列表)。
+
+    **只纠正刚建出来的仓库**（`is_new=True`）。已经存在的仓库一律不动——
+    §0 写明了"不改仓库设置"，把别人（或自己之前）建好的私库悄悄转公开
+    是比"没改成功"严重得多的错误。已存在的只**报告差异**，让用户自己决定。
+    """
+    want = bool(private)
+    label = "私有" if want else "公开"
+    actual, err = repo_visibility(platform, owner, repo, token)
+    notes = []
+
+    if actual is None:
+        notes.append(f"读不到仓库当前可见性（{err}），无法确认是否为{label}——"
+                     f"建议到网页看一眼")
+        return False, notes
+
+    if not is_new:
+        if actual != want:
+            notes.append(f"仓库已存在，当前是{'私有' if actual else '公开'}；"
+                         f"按约定**不改动已存在的仓库设置**——"
+                         f"要改成{label}请到网页仓库设置里改")
+        return True, notes
+
+    if actual == want:
+        return True, notes
+
+    fixed, err2 = api_set_visibility(platform, owner, repo, token, want)
+    if fixed:
+        # Gitee 这条要显式说出来：否则用户会以为建库时那个参数起了作用，
+        # 下次遇到别的平台/别的接口又踩一遍。
+        if platform == "gitee":
+            notes.append(f"⚠️ Gitee 建库接口会忽略可见性参数（实测），"
+                         f"已用 PATCH 补成{label}")
+        return True, notes
+    notes.append(f"改成{label}失败：{err2}")
+    if want:      # 要求私有却留成公开 = 多暴露，这个方向必须吼一声
+        notes.append("⚠️ 仓库当前仍为**公开**，可能有你不希望被看到的内容")
+    return False, notes
 
 
 def create_error_hint(err):
@@ -1569,6 +1667,15 @@ def main():
             continue
         ok(f"{platform} → {web_url(platform, login, repo_name)}"
            f"{'（新建）' if is_new else '（已存在，复用）'}")
+        # 建库接口不可信：Gitee 会静默忽略可见性参数（见 align_visibility 注释）。
+        # 所以建完必须**读回来核对**，不一致就补一刀——这是唯一可靠的路径。
+        _, vis_notes = align_visibility(platform, login, repo_name,
+                                        token, private, is_new)
+        for line in vis_notes:
+            if line.startswith(("⚠️", "改成", "读不到")):
+                warn(line)
+            else:
+                info(line)
         live.append(platform)
 
     if not live:

@@ -365,8 +365,30 @@ def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None):
         calls.setdefault("pushes", []).append(rec)
         return True, "", "直连", ""
 
+    def fake_align(platform, owner, repo, token, private, is_new):
+        calls["align"] = dict(platform=platform, owner=owner, repo=repo,
+                              private=private, is_new=is_new)
+        calls.setdefault("aligns", []).append(dict(platform=platform, owner=owner,
+                                                   repo=repo, private=private,
+                                                   is_new=is_new))
+        return True, []
+
+    def forbidden_http(*a, **k):
+        """守卫：main() 全程不该再碰真实网络。
+
+        踩过（2026-09-23）：给 main() 加了「建库后核对可见性」这一步之后，
+        这里只桩了 api_create_repo，漏桩 align_visibility —— 于是测试拿假令牌
+        去打了真的 gitee.com / api.github.com。**测试照样全绿**（因为请求失败后
+        降级成告警），但已经不再是 hermetic 的：网络一抖结论就变，
+        而且每次跑测试都在对外发请求。所以现在显式插一根钉子。
+        """
+        calls["http"] = calls.get("http", 0) + 1
+        raise AssertionError("main() 试图访问真实网络 —— 有桩没打全")
+
     G.api_login = fake_login
     G.api_create_repo = fake_create
+    G.align_visibility = fake_align
+    G.http_json = forbidden_http
     G.resolve_remotes = fake_resolve
     G.push_platform = fake_push
     G.INTERACTIVE = False
@@ -421,12 +443,22 @@ check("推送的仓库名与建库一致",
       calls2.get("push", {}).get("repo") == "my-repo", f"{calls2.get('push')}")
 check("推送前用 refs 核对过（提示出现）",
       has(msgs2, "git ls-remote 核对远端 refs"), "")
+check("建库后做了可见性核对（这正是 Gitee 会骗人的那一步）",
+      calls2.get("align", {}).get("repo") == "my-repo", f"{calls2.get('align')}")
+check("可见性核对的属主用的是令牌解析出的账号，不是用户输入的地址",
+      calls2.get("align", {}).get("owner") == "zhangsan", f"{calls2.get('align')}")
+check("全新仓库才纠正可见性（is_new=True）",
+      calls2.get("align", {}).get("is_new") is True, f"{calls2.get('align')}")
+check("main() 全程没有碰真实网络（http_json 一次都没被调用）",
+      "http" not in calls2, f"被调用了 {calls2.get('http')} 次")
 
 msgs3, calls3, _, _ = run_main(
     ["--account", "https://gitee.com/zhangsan/", "--public"],
     extra_cfg={"tokens": {"gitee": "tok", "github": ""}})
 check("--public 让建库调用拿到 private=False",
       calls3.get("create", {}).get("private") is False, f"{calls3.get('create')}")
+check("--public 也传到了可见性核对这一关",
+      calls3.get("align", {}).get("private") is False, f"{calls3.get('align')}")
 
 msgs4, calls4, _, _ = run_main(
     ["--account", "https://github.com/octocat/"],
@@ -440,6 +472,8 @@ msgs5, calls5, _, _ = run_main(
 check("仓库已存在时提示「复用」而非报错",
       has(msgs5, "已存在，复用"), "")
 check("已存在也照样推送", "push" in calls5)
+check("已存在的仓库走到可见性核对待查时，is_new=False（不擅自改设置）",
+      calls5.get("align", {}).get("is_new") is False, f"{calls5.get('align')}")
 
 msgs6, calls6, _, _ = run_main(
     ["--account", "https://gitee.com/zhangsan/"],
@@ -447,6 +481,8 @@ msgs6, calls6, _, _ = run_main(
     extra_cfg={"tokens": {"gitee": "tok", "github": ""}})
 check("建库失败时给实名认证提示", has(msgs6, "实名认证"), "")
 check("建库失败时不推送", "push" not in calls6)
+check("建库失败时也不去查可见性（仓库都不存在）", "align" not in calls6,
+      f"{calls6.get('align')}")
 
 print()
 print("=" * 66)
