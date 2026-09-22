@@ -1,0 +1,20 @@
+# 运行/编译产物，永远不要提交 —— 里面会含明文串
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 本机配置与令牌（技能本身不该存令牌，这里只是兜底）
+*.local.json
+.git-sync.json
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
