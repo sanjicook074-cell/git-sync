@@ -236,7 +236,8 @@ python scripts/test_repo_create.py    # 53 项：建库 API 契约、可见性�
 测试里插了一根钉子：`main()` 一旦试图访问真实网络就**直接抛异常**——
 避免"漏打一个桩"让测试悄悄降级成假绿。
 
-**分发前自查**（扫令牌、邮箱、手机号、本机路径、`__pycache__`）：
+**分发前自查**（扫令牌、邮箱、手机号、本机路径、`__pycache__`；
+按**扩展名 + 文件名**双重判据，所以 `LICENSE` / `.gitignore` 这类无扩展名文件也在扫描范围内）：
 
 ```bash
 python scripts/check_clean.py
@@ -252,6 +253,7 @@ python scripts/check_clean.py --deny 你的账号名     # 额外拉黑自定义
 git-sync/
 ├── SKILL.md                   技能定义（给 AI 读：能力、约定、实测记录）
 ├── README.md                  本文件（给人读）
+├── LICENSE                    MIT 许可证
 └── scripts/
     ├── git_sync.py            主程序，纯标准库
     ├── check_clean.py         分发前敏感信息自查
@@ -274,5 +276,11 @@ git-sync/
 
 ## 许可
 
-本仓库**暂未附带开源许可证**（未加许可证 = 默认保留所有权利）。如果打算让别人
-自由使用 / 修改 / 分发，建议加一个 MIT 或 Apache-2.0。
+**MIT**，全文见 [LICENSE](LICENSE)。
+
+```
+Copyright (c) 2026 人间小土鸡
+```
+
+你可以自由使用、修改、分发、商用，只需保留版权声明和许可声明。软件按「原样」
+（AS IS）提供，不附带任何形式的担保。

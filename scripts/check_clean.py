@@ -31,6 +31,15 @@ import sys
 TEXT_EXT = {".py", ".md", ".txt", ".json", ".yml", ".yaml", ".toml",
             ".cfg", ".ini", ".sh", ".bat", ".ps1", ".html", ".css", ".js"}
 
+# 无扩展名但确实是纯文本的文件。
+# ⚠️ 这类文件按扩展名判断会**整份漏掉**——而 `LICENSE` 恰恰是写版权人姓名和
+# 联系邮箱的地方，`.gitignore` 里也可能残留本机路径。实测 2026-09-23：
+# 加了 LICENSE 之后扫到的文件数还是 7，说明它从来没被扫过。
+TEXT_BARE_NAMES = {"license", "licence", "copying", "notice", "authors",
+                   "contributors", "readme", "changelog", "makefile",
+                   "dockerfile", ".gitignore", ".gitattributes",
+                   ".gitmodules", ".editorconfig"}
+
 # 明显是占位/示例的邮箱域名与账号，报出来只会淹没真信号
 EMAIL_PLACEHOLDERS = ("example.com", "example.org", "test.com", "test.local",
                       "localhost", "e.com", "email.com")
@@ -60,6 +69,13 @@ RULES = [
 JUNK_DIRS = {"__pycache__", ".venv", "venv", "node_modules", ".mypy_cache",
              ".pytest_cache", ".idea", ".vscode"}
 JUNK_EXT = {".pyc", ".pyo", ".pyd", ".log", ".tmp", ".bak", ".db", ".sqlite"}
+
+
+def is_text_file(p: pathlib.Path) -> bool:
+    """按扩展名判断，还是按文件名判断——两样都要过，否则会漏掉 LICENSE 这类。"""
+    if p.suffix.lower() in TEXT_EXT:
+        return True
+    return p.name.lower() in TEXT_BARE_NAMES
 
 
 def scan_text(path: pathlib.Path, extra_deny):
@@ -132,7 +148,7 @@ def main(argv=None):
 
     file_hits, n_files = [], 0
     for p in sorted(root.rglob("*")):
-        if not p.is_file() or p.suffix.lower() not in TEXT_EXT:
+        if not p.is_file() or not is_text_file(p):
             continue
         if any(s.lower() in JUNK_DIRS for s in p.parts):
             continue
