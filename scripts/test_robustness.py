@@ -437,6 +437,137 @@ for v, val in _saved_proxy.items():
 
 print()
 print("=" * 60)
+print("11) https 推送不顶掉已有的上游（2026-09-23 实测修）")
+print("=" * 60)
+# 背景：https 推送成功后会写 branch.<b>.remote/merge，目的是让 git status 能看到
+# 远端对比（修早年的 [gone] 问题）。但它原来是**无条件覆盖**的——仓库若是从
+# Gitee clone 下来的（本来就跟踪 origin），推一次 GitHub 就把上游改成 mirror，
+# 用户之后裸跑 git pull 会静默跑去另一个平台。现在改成「已有上游就不动」。
+# 用一个本地裸仓库冒充远端：把 auth_url 换掉，就能离线跑 https 这条路径。
+_bareA = BASE / "bareA.git"
+_bareB = BASE / "bareB.git"
+_bareC = BASE / "bareC.git"
+for _b in (_bareA, _bareB, _bareC):
+    sh(["git", "init", "--bare", "-q", str(_b)])
+_real_auth_url = G.auth_url
+
+
+def _mk_repo(name):
+    d = BASE / name
+    d.mkdir()
+    (d / "c.txt").write_text("x\n", encoding="utf-8")
+    for cmd in (["git", "init", "-b", "main", "-q"],
+                ["git", "config", "user.name", "T"],
+                ["git", "config", "user.email", "t@e.com"],
+                ["git", "add", "-A"],
+                ["git", "commit", "-q", "-m", "first"]):
+        sh(cmd, cwd=str(d), env=G.net_env())
+    return d
+
+
+# 11a) 已有上游 -> 必须保持不动
+_r1 = _mk_repo("upstream_keep")
+sh(["git", "remote", "add", "origin", str(_bareA)], cwd=str(_r1), env=G.net_env())
+sh(["git", "push", "-q", "-u", "origin", "main:main"], cwd=str(_r1), env=G.net_env())
+_before = sh(["git", "config", "--get", "branch.main.remote"], cwd=str(_r1)).stdout.strip()
+check("前置：这个仓库本来就跟踪 origin", _before == "origin", f"up={_before!r}")
+
+G.auth_url = lambda *a, **k: str(_bareB)      # https 路径改打本地裸仓库
+_p1, _e1, _v1, _n1 = G.push_platform(_r1, "github", "mirror", "main",
+                                     "u", "r", "t", "https", args)
+G.auth_url = _real_auth_url
+check("https 路径推到第二个远端成功", _p1, f"err={_e1[:120]!r}")
+_after = sh(["git", "config", "--get", "branch.main.remote"], cwd=str(_r1)).stdout.strip()
+check("已有上游 origin 没被顶成 mirror", _after == "origin", f"up={_after!r}")
+_bsha, _ = G.read_remote_sha(_r1, G.git_prefix("github.com"), str(_bareB), "main", G.net_env())
+check("第二个远端确实收到了这次提交", _bsha != "", f"sha={_bsha[:8]!r}")
+
+# 11b) 没有上游 -> 照常建立（别把早年修的 [gone] 又弄回来）
+_r2 = _mk_repo("upstream_fresh")
+_fresh_before = sh(["git", "config", "--get", "branch.main.remote"],
+                   cwd=str(_r2)).stdout.strip()
+check("前置：新仓库没有上游", _fresh_before == "", f"up={_fresh_before!r}")
+G.auth_url = lambda *a, **k: str(_bareC)      # 换一个干净的裸仓库，避免历史冲突
+_p2, _e2, _v2, _n2 = G.push_platform(_r2, "gitee", "origin", "main",
+                                     "u", "r", "t", "https", args)
+G.auth_url = _real_auth_url
+check("https 路径推送成功（新仓库）", _p2, f"err={_e2[:120]!r}")
+_fresh_after = sh(["git", "config", "--get", "branch.main.remote"],
+                  cwd=str(_r2)).stdout.strip()
+check("没有上游时会建立（本次修复没把它弄坏）",
+      _fresh_after == "origin", f"up={_fresh_after!r}")
+
+print()
+print("=" * 60)
+print("12) 校验失败的原因不能被丢掉（2026-09-23 实测修）")
+print("=" * 60)
+# 实测现场：重推一个**已经同步好**的仓库时，push 回了 "Everything up-to-date"
+# （读着像一切正常），而同一时刻代理抽风让 ls-remote 失败
+# （CONNECT tunnel failed, response 502）。
+# 脚本原来写的是 `remote_sha, _ = read_remote_sha(...)`——**把校验错误丢了**，
+# 于是把 "Everything up-to-date" 当失败原因报出来；这句话不像网络错误，
+# 阶梯在第 1 级就断死，「清代理」那几档一次都没试——而那几档恰恰治这个。
+UP_TO_DATE = "Everything up-to-date"
+PROXY_502 = ("fatal: unable to access "
+             "'https://github.com/lisi/expotool.git/': "
+             "CONNECT tunnel failed, response 502")
+_vf_n = [0]
+
+
+def push_with_verify_failing(verify_err, succeed_at=None):
+    """push 输出看起来正常，但**校验阶段**失败；succeed_at 次尝试起才校验通过。"""
+    _r, _o, _s, _ips = G.run, G.git_out, G.read_remote_sha, G.github_ips
+    issued, state = [], {"n": 0}
+    saved_env = {v: os.environ.get(v) for v in G.PROXY_VARS}
+    try:
+        for v in G.PROXY_VARS:
+            os.environ.pop(v, None)
+        os.environ["https_proxy"] = "http://127.0.0.1:7890"   # 现场就是配着代理
+
+        def fake_run(cmd, **kw):
+            issued.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr=UP_TO_DATE)
+
+        def fake_sha(*a, **k):
+            state["n"] += 1
+            if succeed_at is not None and state["n"] >= succeed_at:
+                return ("a" * 40, "")
+            return ("", verify_err)
+
+        G.run = fake_run
+        G.read_remote_sha = fake_sha
+        G.git_out = lambda *a, **k: "a" * 40
+        G.github_ips = lambda *a, **k: ["192.0.2.1", "192.0.2.2"]
+        _vf_n[0] += 1
+        root = _mk_repo(f"verifyfail{_vf_n[0]}")
+        return G.push_platform(root, "github", "mirror", "main",
+                               "lisi", "expotool", "tok", "https", args), issued
+    finally:
+        G.run, G.git_out, G.read_remote_sha, G.github_ips = _r, _o, _s, _ips
+        for v in G.PROXY_VARS:
+            os.environ.pop(v, None)
+        for v, val in saved_env.items():
+            if val is not None:
+                os.environ[v] = val
+
+
+(_pa, _ea, _va, _na), _ia = push_with_verify_failing(PROXY_502)
+_fa = [str(x) for c in _ia for x in c]
+check("校验失败是网络类 → 会继续降级（回归：原来第 1 级就断死）",
+      len(_ia) > 1, f"只跑了 {len(_ia)} 级")
+check("一路升到「绑 IP」那一级",
+      any("http.curloptResolve" in s for s in _fa), f"共 {len(_ia)} 级")
+check("报出来的是**校验**失败原因，不是那句 Everything up-to-date",
+      "CONNECT tunnel failed" in _ea and not _ea.startswith(UP_TO_DATE),
+      f"err={_ea[:110]!r}")
+
+(_pb, _eb, _vb, _nb), _ib = push_with_verify_failing(PROXY_502, succeed_at=2)
+check("第 2 次尝试起校验通过 → 报告成功（「清代理」那级真能救回来）",
+      _pb is True, f"err={_eb[:130]!r} 共跑了 {len(_ib)} 级")
+check("救回来时报告了通道名", bool(_vb), f"via={_vb!r}")
+
+print()
+print("=" * 60)
 print(f"结果：{len(passed)} 通过 / {len(failed)} 失败")
 if failed:
     for f in failed:

@@ -43,7 +43,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 
 CONFIG_PATH = Path.home() / ".workbuddy" / "git-sync.json"
 
@@ -1380,13 +1380,22 @@ def push_platform(root, platform, remote, branch, login, repo, token, proto, arg
         output = clean_output((proc.stderr or "") + (proc.stdout or ""))
 
         # 不看退出码，直接问远端
-        remote_sha, _ = read_remote_sha(root, prefix, target, branch, env)
+        remote_sha, verify_err = read_remote_sha(root, prefix, target, branch, env)
         if remote_sha and remote_sha == local_sha:
             mode = ""
             if proto != "ssh":
-                git(["config", f"branch.{branch}.remote", remote], cwd=root)
-                git(["config", f"branch.{branch}.merge",
-                     f"refs/heads/{branch}"], cwd=root)
+                # 只在「还没有上游」或「上游正好是刚推的这个远端」时写。
+                # 已有上游就**不动它**——典型场景：仓库是从 Gitee clone 下来的，
+                # 本来就跟踪 origin，推一次 GitHub 就把上游改成 mirror，
+                # 用户之后裸跑 git pull 会静默地去另一个平台拉。见 §7.12。
+                cur_up = git_out(["config", "--get", f"branch.{branch}.remote"], root)
+                if not cur_up or cur_up == remote:
+                    git(["config", f"branch.{branch}.remote", remote], cwd=root)
+                    git(["config", f"branch.{branch}.merge",
+                         f"refs/heads/{branch}"], cwd=root)
+                else:
+                    info(f"{branch} 分支原本跟踪 {cur_up}，保持不动"
+                         f"（本次推到了 {remote}）")
                 # 补上 remote-tracking ref。推送走的是「带令牌的显式 URL」而不是 remote 名，
                 # 所以 git 不会自己建 refs/remotes/<remote>/<branch>。不补的话：
                 # ① git status / PyCharm 看不到与远端的对比；② 用户随后裸跑
@@ -1409,8 +1418,24 @@ def push_platform(root, platform, remote, branch, login, repo, token, proto, arg
                 note = f"{note}；{extra}" if note else extra
             return True, "", label, note
 
-        last_err = output or "未收到远端响应"
-        if is_network_error(last_err):
+        # ⚠️ 失败原因要把**两部分**都看上：push 的输出，以及校验的错误。
+        # 原来这里写的是 `remote_sha, _ = read_remote_sha(...)`——**把校验错误
+        # 直接丢进了垃圾桶**，只看 push 的输出。实测（2026-09-23，重推
+        # taskcleaner）：push 回 "Everything up-to-date"（读着像一切正常），
+        # 而校验因为代理 502 失败了；只信 push 的输出就会报出一句不像网络
+        # 错误的文本，于是**阶梯在第 1 级断死**，「清代理」那几档一次都没试
+        # ——而那几档恰恰治这个。见 §7.13。
+        if is_network_error(output):
+            last_err = output                      # 原有行为不变
+        elif is_network_error(verify_err):
+            last_err = verify_err                  # 校验才是"为什么没核对上"
+            if output and output not in last_err:
+                last_err += f"\n（push 自己的输出：{output}）"
+        else:
+            last_err = output or verify_err or "未收到远端响应"
+
+        # 任一边像网络问题就继续降级，别被另一边的"看起来正常"骗住
+        if is_network_error(output) or is_network_error(verify_err):
             continue
         # 「权限类错误立即停」这条规矩有个例外，实测踩出来的：
         # 代理在拒绝 CONNECT 时会把认证失败"借"给 git，看着像令牌没权限。

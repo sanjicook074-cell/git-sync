@@ -1,6 +1,6 @@
 ---
 name: git-sync
-description: 把本地文件夹变成 Gitee / GitHub 上的仓库并推上去 —— 建远端仓库、配远端、提交、推送；也管推完之后的事：看本地与远端是否同步、拉取最新、把两个平台对齐。全流程非交互、永不挂起，永不 force push。直接运行时是四问向导（问账号 → 问令牌 → 问文件夹 → 问仓库名，然后自动建库推送）；作为技能调用时带 --account/--dir/--yes 全自动，一条命令从「一个本地文件夹」到「代码已在远端」。当用户说「把这个项目传到 Gitee / GitHub」「同步一下代码」「上传到码云」「建个仓库推上去」「初始化仓库并首次推送」「这文件夹还没进版本控制 / 还不是 git 仓库，帮我弄上去」「一键上传代码」「把代码备份到远端」「帮我传上去，用我的账号」，或报告「git push 让我输密码 / 卡住不动 / 弹出选择框」「push 报 Incorrect username or password (access token)」「远端仓库不存在 / 404」「仓库里文件太大推不上去」「推送超限」时使用。**推完之后的问题也用本技能**：用户问「同步了没 / 有没有同步 / 落后几个提交 / 两个平台是不是一致 / 哪个平台是旧的」（用 --status）、「把最新的拉下来 / 更新一下 / 我在另一台机器上改过 / 我在网页上直接改过」（用 --pull）、「两个平台对不上了 / 补一下 GitHub / 帮我对齐」（用 --align）。**「从本地目录到远端仓库」以及「本地与远端的同步状态」这两类需求一律用本技能**：只有它会调 API 帮你把远端仓库建出来（无需先去网页手工建库），其余 git 工作流类技能都要求你先手工建好库再给它 URL。
+description: 把本地文件夹变成 Gitee / GitHub 上的仓库并推上去 —— 建远端仓库、配远端、提交、推送；也管推完之后的事：看本地与远端是否同步、拉取最新、把两个平台对齐。全流程非交互、永不挂起，永不 force push。直接运行时是四问向导（问账号 → 问令牌 → 问文件夹 → 问仓库名，然后自动建库推送）；作为技能调用时带 --account/--dir/--yes 全自动，一条命令从「一个本地文件夹」到「代码已在远端」。当用户说「把这个项目传到 Gitee / GitHub」「同步一下代码」「上传到码云」「建个仓库推上去」「初始化仓库并首次推送」「这文件夹还没进版本控制 / 还不是 git 仓库，帮我弄上去」「一键上传代码」「把代码备份到远端」「帮我传上去，用我的账号」，或报告「git push 让我输密码 / 卡住不动 / 弹出选择框」「push 报 Incorrect username or password (access token)」「远端仓库不存在 / 404」「仓库里文件太大推不上去」「推送超限」时使用。**推完之后的问题也用本技能**：用户问「同步了没 / 有没有同步 / 落后几个提交 / 两个平台是不是一致 / 哪个平台是旧的」（用 --status）、「把最新的拉下来 / 更新一下 / 我在另一台机器上改过 / 我在网页上直接改过」（用 --pull）、「两个平台对不上了 / 补一下 GitHub / 帮我对齐」（用 --align）。**「把 Gitee 上的仓库搬到 GitHub / 镜像到另一个平台 / 那边也放一份」也用本技能**：clone 由原生 git 做，本技能负责建库 + 推送（注意分支名可能是 master，且 `--dry-run` 在干净仓库上会空转，要另跑 `check_clean.py`，见 §7.12）。**「从本地目录到远端仓库」以及「本地与远端的同步状态」这两类需求一律用本技能**：只有它会调 API 帮你把远端仓库建出来（无需先去网页手工建库），其余 git 工作流类技能都要求你先手工建好库再给它 URL。
 agent_created: true
 ---
 
@@ -28,6 +28,8 @@ agent_created: true
 | **双平台补推对齐（`--align`）** | Git LFS |
 | 推送前体检：密钥泄漏 + 大文件超限 | 在组织/公司名下建库（无 `--org`，只建到个人账号） |
 | 核对「账号地址」与「令牌所属账号」是否一致 | 替你完成 Gitee 实名认证（只能人工做） |
+| **把已有仓库镜像到另一个平台**（clone 用原生 git 做，本技能负责建库 + 推送） | **克隆远端仓库到本地**（用 `git clone` 即可，本技能不代劳） |
+| **不顶掉仓库原有的上游**（v1.13.0 起；已有 `origin` 就保持不动） | 合并分叉、改历史 |
 
 ---
 
@@ -502,6 +504,14 @@ python git_sync.py --pull --align        # 拉完顺手对齐
   分类函数把两者混同，就会让**整个降级机制在最需要它的场景里失效**——
   而且失败报告会长得非常像"就是你的令牌不对"。
 - **绑 IP 要用 DNS 当前结果，不是写死的老段**（见 §2 第 20 条）。
+- ⚠️ **"校验失败"的错误必须参与判定，不能丢**（2026-09-23，v1.13.0，见 §7.13）。
+  `read_remote_sha()` 返回 `(sha, err)`，那个 `err` 里装的往往就是**真正的失败原因**。
+  实测：`git push` 回 `Everything up-to-date`（**读着像一切正常**），而同一轮
+  `ls-remote` 被本地代理拦了（`CONNECT tunnel failed, response 502`）。
+  只信 push 的输出 → 报出一句不像网络错误的文本 → **阶梯第 1 级断死**，
+  「清代理」那几档白放着。**同一轮里两个子命令对代理的运气可以不一样。**
+  正确判据是**任一边像网络问题都要继续降级**，而不是"以哪一边为准"——
+  后者是措辞问题，前者是行为问题，别混着改。
 - 单次推送上限 150 秒，整条链总预算 300 秒，不会无限拖。
 - 每次尝试后都跑 `git ls-remote` 核对 SHA，所以**静默成功和静默失败都能正确判定**。
 - 推送成功后补 `refs/remotes/<remote>/<branch>`（走 `ensure_remote_ref()`）：推送用的是
@@ -658,6 +668,12 @@ python scripts/git_sync.py --set-token github=ghp_xxx
 现已改为按地址复用（`remote_matches()` / `resolve_remotes()`，`test_robustness.py` §7 有 17 条断言）。
 若手上还有旧版本留下的重复远端，`git remote remove <多余的那个>` 删掉即可。
 
+⚠️ **同理，`branch.<分支>.remote`（上游）也不顶掉已有的**（v1.13.0 起，见 §7.12）。
+推送成功后脚本会写上游，为的是让 `git status` 能看到远端对比（修早年的 `[gone]`）。
+但只在**没有上游**或**上游正好是刚推的这个远端**时才写；已有上游就保持不动，
+并打印「`<分支>` 分支原本跟踪 `origin`，保持不动（本次推到了 `mirror`）」。
+→ 所以**从别的平台 clone 下来镜像过去的仓库，裸跑 `git pull` 拉的还是原来那个平台**。
+
 ⚠️ **`--name` 是全局的，两个平台共用同一个仓库名**。想两边叫不一样（例：Gitee `helloai-demo`、
 GitHub `helloai`）不能一次跑完——必须分两次、各带各的 `--name`。分次跑时**别用 `--platform both`**，
 否则会给另一个平台建出一个同名的新仓库（真实副作用，不是提示）。
@@ -698,6 +714,9 @@ GitHub `helloai`）不能一次跑完——必须分两次、各带各的 `--nam
 | `git ls-remote` / `git fetch` 报 `could not read Username for 'https://gitee.com'` | remote 是裸 HTTPS，而本机凭据助手被禁用，git 自己拿不到令牌 | 属预期现象。用本脚本（自带令牌）；或 `--remember-credentials` 把令牌交给凭据管理器 |
 | `git tag` 静默不生效 | 同上，写 `refs/tags/**` 也被拦 | 打完用 `git show-ref` 确认；本环境别依赖 tag |
 | `git remote -v` 里两个远端指向同一仓库（如 `mirror` + `github-remote`） | v1.5.2 及以前按**名字**挑远端（§2 第 19 条） | 删掉多余的那个：`git remote remove github-remote`；v1.6.0 起已按地址复用，不会再发生 |
+| **推送报失败，错误却是 `Everything up-to-date`**（远端其实和本地一致） | ⚠️ **校验的错误被丢掉了**：push 那一步通了，而核对用的 `ls-remote` 被代理拦了（`CONNECT tunnel failed`）。v1.12.0 及以前只看 push 的输出 → 报出这句"看着没事"的话 → 阶梯第 1 级断死 | 升级到 v1.13.0（校验错误参与降级判定）。自诊：`git ls-remote <远端URL> refs/heads/<分支>` 看是不是代理 502；临时 `unset https_proxy` 再试。**别去查令牌** |
+| **从别的平台 clone 下来镜像过去，仓库的上游被悄悄改了** | v1.12.0 及以前 https 推送成功后**无条件**写 `branch.<分支>.remote`，把原有的 `origin`（如 Gitee）顶成了新推的远端（如 `mirror`）。之后裸跑 `git pull` 会去另一个平台拉 | 升级到 v1.13.0（已有上游不动，并打印"保持不动"）。手动还原：`git config branch.<分支>.remote origin && git config branch.<分支>.merge refs/heads/<分支>` |
+| **镜像已有仓库时，`--dry-run` 报「暂存区是空的，没有任何文件会被推送」** | 不是错误：clone 下来的仓库工作区本来就干净，暂存区 0 文件，而**密钥体检是针对暂存区做的**——所以它这次**什么都没扫** | 另外独立扫一遍内容：`python scripts/check_clean.py --dir <目录>`。**别把"空转的体检"当成"体检通过"** |
 | 体检说「将推送 1 项改动，合计 0 B」 | 这一项是**删除**，体积本来就是 0 | v1.6.0 起会单独写明「其中 N 项是删除（…）」；老版本看 `git diff --cached --name-status` 即可 |
 | 提交时弹 .NET Framework 4.7.2 安装引导 | GCM 依赖 .NET 4.7.2+ | 改用 git 自带的 `wincred`：`git config --local credential.helper wincred` |
 | `~/.git-credentials` 里出现明文令牌 | 全局 `credential.helper=store` | 只在本仓库设 helper，别用 global store |
@@ -1141,6 +1160,118 @@ api.github.com 的仓库简介（读回复核过），而且 v1.10.0 那轮还�
 
 **测试规模：223 → 283 条全过**（新增 `test_sync_modes.py` 60 条）。
 版本 v1.11.0 → **v1.12.0**。
+
+### 7.12 第八次：别人家的仓库镜像过来（2026-09-23，v1.13.0）
+
+**任务**：用户给了 `https://gitee.com/sweetsocks/taskcleaner`，要"拉下来同步到 github"。
+这是一个**新场景**：不是"本地文件夹 → 远端"，而是"**从 A 平台 clone 下来 → 推给 B 平台**"。
+
+**先说边界**：**clone 不在本技能能力范围内**（§0 明写"不做克隆"），所以克隆用原生 git 做，
+本技能负责"建库 + 推送"。命令组合是：
+
+```bash
+git clone https://gitee.com/<owner>/<repo>.git <dir>       # 原生 git，公开库不需要令牌
+python git_sync.py --dir <dir> --platform github \
+    --account https://github.com/<owner>/ --name <repo> \
+    --public --branch master --yes
+```
+
+**三个现场要注意的点**：
+
+1. **分支名要跟上**。这个仓库的默认分支是 `master`，不是 `main`。脚本默认"沿用仓库
+   当前分支"（`--branch` 缺省即可），但**别想当然认为都是 main**——先 `git branch` 看一眼。
+2. **`--dry-run` 在这种场景下几乎是空转**：仓库是刚 clone 的、工作区干净，
+   `git add -A` 之后暂存区 0 个文件，于是体检报「**暂存区是空的，没有任何文件会被推送**」
+   ——它**什么都没扫**。而脚本的密钥体检是**针对暂存区**的（§2 第 4 条），暂存区空 = 没体检。
+   → **镜像已有仓库时，必须另外独立扫一遍内容**：`check_clean.py --dir <dir>`（§8）。
+   这次扫了 90 个文件，命中 2 处，逐条看过确认是误报
+   （`comtypes` 自动生成的类型库里那两条 COM 属性声明——属性名叫 `Password`，
+   值是 `hints.normal_property`，跟真口令没关系）。
+   ⚠️ **不能因为"它本来在 Gitee 上就是公开的"就跳过这一步**——那是"已经在别处公开了"，
+   跟"确认里面没有密钥"是两件事。
+3. **可见性照搬源仓库**。`--public` / `--private` 得跟原仓库一致（这次是公开），
+   别默认私有——镜像的意义就是两边一样。
+
+**抓到的两个真 bug（都在这轮修掉，v1.13.0）：**
+
+**bug 1：https 推送成功后，**无条件**顶掉已有的上游。**
+
+修 `[gone]` 那个老问题（§7.5）时加的这段，是**无条件覆盖**：
+
+```python
+git(["config", f"branch.{branch}.remote", remote], cwd=root)
+```
+
+对"新仓库"是对的。但对"**从 Gitee clone 下来的仓库**"就有副作用：它本来就跟踪
+`origin`（Gitee），推一次 GitHub 之后上游被改成 `mirror`——**用户之后裸跑
+`git pull` 会静默地去 GitHub 拉**，而他还以为是从 Gitee 拉。没有任何提示。
+→ 改成：**已有上游就不动它**（只在"没有上游"或"上游正好是刚推的这个远端"时才写），
+并明确告知「`master` 分支原本跟踪 `origin`，保持不动（本次推到了 `mirror`）」。
+→ 顺带说明为什么"第一个平台的赢"是对的：`PLATFORMS` 顺序是 `gitee, github`，
+所以新仓库推两平台时上游落在 gitee——和 §7.5 观测到的 `## main...origin/main` 一致。
+
+**bug 2（更值钱）：校验失败的原因被丢掉了，导致降级阶梯白放着。**
+
+修完 bug 1 后重推同一个仓库做验证，脚本报**推送失败**，错误是：
+
+```
+[出错] github 推送失败
+       Everything up-to-date
+```
+
+而**远端和本地明明是一致的**（几分钟前刚用 API 核对过）。去查：
+
+```
+read_remote_sha 返回: '' | err = "fatal: unable to access '...': CONNECT tunnel failed, response 502"
+```
+
+**代理又抽风了**（老问题，§2 第 17 条）。可 `git push` 那一步打印的是
+`Everything up-to-date`——**两个子命令看到的网络状况不一样**，一个通了、一个被代理拦了。
+
+根因在这一行：
+
+```python
+remote_sha, _ = read_remote_sha(root, prefix, target, branch, env)
+#             ↑ 这个下划线里装的正是 "CONNECT tunnel failed, response 502"
+```
+
+**校验的错误被丢进了垃圾桶**，于是：
+
+1. 报出来的失败原因是 `Everything up-to-date`（**读着像一切正常**）；
+2. 这句话不像网络错误 → `is_network_error()` 判否 → **阶梯在第 1 级就断死**，
+   「清代理」那几档一次都没试——**而那几档恰恰是治这个的**。
+
+危害和 §7.10 一模一样：**整个自救机制在最需要它的场景里失效，而且失败报告长得像"没事"**。
+
+→ 修复：校验的错误必须参与判定。
+
+```python
+remote_sha, verify_err = read_remote_sha(...)      # 别再丢
+# 失败原因：push 的输出 **和** 校验的错误都要看
+if is_network_error(output):      last_err = output        # 原有行为不变
+elif is_network_error(verify_err): last_err = verify_err    # 校验才是"为什么没核对上"
+else:                              last_err = output or verify_err or "未收到远端响应"
+# 任一边像网络问题就继续降级，别被另一边的"看起来正常"骗住
+if is_network_error(output) or is_network_error(verify_err):
+    continue
+```
+
+⚠️ **这里有个我自己踩的坑**：第一版改成了"**以校验错误为准**"
+（`last_err = verify_err or output`），结果把 §9 的三条测试弄红了——
+那边的桩把 `verify_err` 写成了无意义的占位串 `"boom"`，于是"两边都不像网络错误"
+→ 不再降级。**这暴露了正确判据不是"谁优先"，而是"任一边像网络问题都要继续降级"。**
+"以谁为准"是**措辞**问题，"谁决定要不要继续"是**行为**问题，两件事别混在一起改。
+
+**真机复验**：修完再推同一个仓库 → `[OK] github 推送成功（直连）`，11.5 秒，
+且 `master 分支原本跟踪 origin，保持不动（本次推到了 mirror）`。上游保住了。
+
+**测试规模：283 → 295 条全过**（`test_robustness.py` 67 → 79，新增 §11 上游保持 8 条、
+§12 校验错误不丢 5 条）。版本 v1.12.0 → **v1.13.0**。
+
+**这一轮最值得记的**：**"命令A说没事"和"命令B说连不上"可以同时成立。**
+`git push` 和 `git ls-remote` 打的是同一个地址，但对代理的运气不一样。
+所以"校验失败"必须当成**一等公民的错误**来对待——它自己就是失败原因的来源，
+不能只当"确认一下"的附加步骤，更不能把它的返回值丢掉。
 
 ---
 
