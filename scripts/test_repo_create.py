@@ -272,6 +272,224 @@ check("8f **要求私有却仍是公开 -> 明确警示**",
 
 print()
 print("=" * 64)
+print("9) --visibility：改**已存在**仓库的可见性（建库那条路故意不管已存在的库）")
+print("=" * 64)
+print("  背景：--public/--private 只纠正「刚建出来」的仓库；已存在的按约定不动。")
+print("  要把现成的库转公开，只能走这个显式入口 —— 这一节钉死它的三道闸：")
+print("  ① 改完必读回 ② 不 --yes 必须停下 ③ 转公开要问一次、默认不能是「是」。")
+
+
+class NS:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class VisStub:
+    """有状态的假远端：GET 读当前可见性，PATCH 改它。
+
+    这一节要验的恰恰是「改完读回来」是否正确，所以不能像 FakeResponse 那样
+    对同一条件永远返回同一个值 —— 那会把「没生效」和「生效了」测成一样。
+    """
+
+    def __init__(self, private, get_status=200, patch_status=200, patch_applies=True):
+        self.private = private
+        self.get_status = get_status
+        self.patch_status = patch_status
+        self.patch_applies = patch_applies   # 造「PATCH 返回 200 却没生效」的情形
+        self.requests = []
+
+    def __call__(self, url, method="GET", body=None, form=None, token=None):
+        self.requests.append(dict(url=url, method=method, body=body, form=form, token=token))
+        if method == "PATCH":
+            if self.patch_status != 200:
+                return self.patch_status, {"message": "boom"}, "boom"
+            if self.patch_applies:
+                raw = (form or body or {}).get("private")
+                self.private = (raw is True) or (str(raw).lower() == "true")
+            return 200, {"private": self.private}, ""
+        if self.get_status != 200:
+            return self.get_status, {"message": "Not Found"}, "Not Found"
+        return 200, {"private": self.private}, ""
+
+    def patches(self):
+        return [r for r in self.requests if r["method"] == "PATCH"]
+
+    def gets(self):
+        return [r for r in self.requests if r["method"] == "GET"]
+
+
+def cfg_of(gitee_token="T", gitee_login="alice", gh_token="", gh_login=""):
+    return {"tokens": {"gitee": gitee_token, "github": gh_token},
+            "logins": {"gitee": gitee_login, "github": gh_login},
+            "identity": {}, "defaults": {"platforms": ["gitee"], "private": True}}
+
+
+def vargs(**kw):
+    d = dict(visibility="public", name="demo", dir=None, account=None,
+             platform="gitee", yes=True, dry_run=False)
+    d.update(kw)
+    return NS(**d)
+
+
+def capture(fn):
+    """跑一遍并收走它会打印的东西 —— 有些结论只体现在话里。"""
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = fn()
+    return code, buf.getvalue()
+
+
+REAL_INTERACTIVE, REAL_ASK = G.INTERACTIVE, G.ask_bool
+G.INTERACTIVE = False            # 测试环境必须是非交互，否则会真等人敲键盘
+
+# --- 9a 已经是公开 -> 一个请求都不多发 ---
+st = VisStub(private=False)
+G.http_json = st
+code, text = capture(lambda: G.run_visibility_mode(cfg_of(), vargs(visibility="public")))
+check("9a 已经是要的状态 -> 成功码", code == G.SYNC_EXIT_IN_SYNC, f"{code}")
+check("9a 不发多余 PATCH", st.patches() == [], f"{len(st.patches())} 次")
+check("9a 只读了一次", len(st.gets()) == 1, f"{len(st.gets())} 次")
+
+# --- 9b 私有的库转公开：要 PATCH，而且**必须读回来确认** ---
+st = VisStub(private=True)
+G.http_json = st
+code, text = capture(lambda: G.run_visibility_mode(cfg_of(), vargs(visibility="public")))
+check("9b 转公开成功", code == G.SYNC_EXIT_IN_SYNC, f"{code}")
+check("9b 发了 PATCH", len(st.patches()) == 1, f"{len(st.patches())} 次")
+if st.patches():
+    f = st.patches()[0]["form"] or {}
+    check("9b PATCH 带 name（Gitee 少了会 400 name is missing）", f.get("name") == "demo", f"{f}")
+    check("9b PATCH 带 path", f.get("path") == "demo", f"{f}")
+    check("9b PATCH 显式传 private=false", f.get("private") is False, f"{f}")
+    check("9b 走的是 /repos/alice/demo",
+          st.patches()[0]["url"].split("?")[0].endswith("/repos/alice/demo"),
+          st.patches()[0]["url"])
+check("9b ⭐ 改完读回来了（GET ≥ 2 次：改前 + 改后）", len(st.gets()) >= 2, f"{len(st.gets())} 次")
+check("9b 远端状态真的变了", st.private is False)
+check("9b 话里说清了「已确认为公开」", "已确认为公开" in text, text[-200:])
+
+# --- 9c ⭐ PATCH 返回 200 却没生效 -> 绝不能当成功 ---
+st = VisStub(private=True, patch_applies=False)
+G.http_json = st
+code, text = capture(lambda: G.run_visibility_mode(cfg_of(), vargs(visibility="public")))
+check("9c 返回码不是 0（不假装成功）", code != G.SYNC_EXIT_IN_SYNC, f"{code}")
+check("9c 明说「读回来仍是私有」", "仍是私有" in text, text[-260:])
+check("9c 指向网页设置（人能手动补救）", "网页" in text)
+
+# --- 9d 非交互 + 没 --yes -> 直接拒绝，一个都不动 ---
+st = VisStub(private=True)
+G.http_json = st
+try:
+    capture(lambda: G.run_visibility_mode(cfg_of(), vargs(visibility="public", yes=False)))
+    code = None
+except SystemExit as e:
+    code = e.code
+check("9d 非交互下没 --yes -> 拒掉（退出码 1）", code == 1, f"{code}")
+check("9d ⭐ 拒绝时一个仓库都没动", st.patches() == [], f"{st.patches()}")
+
+# --- 9e 交互式下用户答「否」-> 取消，也不动 ---
+st = VisStub(private=True)
+G.http_json = st
+G.INTERACTIVE = True
+G.ask_bool = lambda *a, **k: False
+code, text = capture(lambda: G.run_visibility_mode(cfg_of(), vargs(visibility="public", yes=False)))
+G.INTERACTIVE, G.ask_bool = REAL_INTERACTIVE, REAL_ASK
+check("9e 用户拒绝 -> 正常收尾（不是错误退出）", code == G.SYNC_EXIT_IN_SYNC, f"{code}")
+check("9e 用户拒绝 -> 不发 PATCH", st.patches() == [])
+check("9e 用户拒绝 -> 明说「一个都没有改」", "一个都没有改" in text, text[-160:])
+
+# --- 9e2 问句的默认值必须是「否」：回车不能把私库变公开 ---
+prompts = []
+G.INTERACTIVE = True
+G.ask_bool = lambda prompt, default=True, yes_mode=False: (prompts.append(default), False)[1]
+st = VisStub(private=True)
+G.http_json = st
+capture(lambda: G.run_visibility_mode(cfg_of(), vargs(visibility="public", yes=False)))
+G.INTERACTIVE, G.ask_bool = REAL_INTERACTIVE, REAL_ASK
+check("9e2 ⭐ 转公开的确认默认是「否」（回车 = 不改）", prompts == [False], f"{prompts}")
+
+# --- 9f --dry-run：只说计划，不动手 ---
+st = VisStub(private=True)
+G.http_json = st
+code, text = capture(lambda: G.run_visibility_mode(
+    cfg_of(), vargs(visibility="public", dry_run=True)))
+check("9f 演练不发 PATCH", st.patches() == [])
+check("9f 演练不算失败", code == G.SYNC_EXIT_IN_SYNC, f"{code}")
+check("9f 说明是演练、没改动", "演练" in text)
+check("9f 仍会说出「私有 → 公开」的计划", "→" in text)
+
+# --- 9g 仓库不存在 -> 停下，不猜、不改 ---
+st = VisStub(private=True, get_status=404)
+G.http_json = st
+code, text = capture(lambda: G.run_visibility_mode(cfg_of(), vargs(visibility="public")))
+check("9g 读不到 -> 不通的退出码（不是成功）", code == G.SYNC_EXIT_UNREACHABLE, f"{code}")
+check("9g 读不到时不发 PATCH", st.patches() == [])
+check("9g 说清「读不到」而不是当成公开", "读不到" in text)
+
+# --- 9h 缺令牌/账号 -> 跳过并提示怎么配 ---
+st = VisStub(private=True)
+G.http_json = st
+code, text = capture(lambda: G.run_visibility_mode(
+    cfg_of(gh_token="", gh_login=""), vargs(platform="github")))
+check("9h 缺令牌 -> 不算成功", code == G.SYNC_EXIT_NEEDS_HUMAN, f"{code}")
+check("9h 一个请求都不发", st.requests == [], f"{st.requests}")
+check("9h 提示 --set-token 怎么配", "--set-token" in text)
+
+# --- 9i --name 给成路径 -> 早期就拦下（别去改一个不存在的仓库名） ---
+try:
+    capture(lambda: G.run_visibility_mode(cfg_of(), vargs(name="a/b")))
+    code = None
+except SystemExit as e:
+    code = e.code
+check("9i --name 是路径 -> 拦下", code == 1, f"{code}")
+
+# --- 9j 没给 --name 时按 --dir 的目录名推断 ---
+st = VisStub(private=True)
+G.http_json = st
+capture(lambda: G.run_visibility_mode(
+    cfg_of(), vargs(name=None, dir="C:/tmp/somewhere/myproj")))
+check("9j 按目录名推断出仓库名",
+      any("/repos/alice/myproj" in r["url"] for r in st.requests),
+      f"{[r['url'] for r in st.requests][:2]}")
+
+# --- 9k 反方向也要能用（公开 -> 私有） ---
+st = VisStub(private=False)
+G.http_json = st
+code, text = capture(lambda: G.run_visibility_mode(cfg_of(), vargs(visibility="private")))
+check("9k 转私有成功", code == G.SYNC_EXIT_IN_SYNC, f"{code}")
+check("9k 传了 private=true",
+      bool(st.patches()) and (st.patches()[0]["form"] or {}).get("private") is True,
+      f"{st.patches()[:1]}")
+check("9k 状态变成私有", st.private is True)
+
+# --- 9l GitHub 走 JSON body，不是 form ---
+st = VisStub(private=True)
+G.http_json = st
+capture(lambda: G.run_visibility_mode(
+    cfg_of(gh_token="ghp_X", gh_login="alice"), vargs(platform="github")))
+p = st.patches()[0]
+check("9l GitHub PATCH 走 body", p["body"] == {"private": False}, f"{p['body']}")
+check("9l GitHub PATCH 不带 form", p["form"] is None, f"{p['form']}")
+check("9l GitHub PATCH 带令牌", p["token"] == "ghp_X", f"{p['token']!r}")
+
+# --- 9m 两个平台一次改完（各用各的账号） ---
+st = VisStub(private=True)
+G.http_json = st
+code, text = capture(lambda: G.run_visibility_mode(
+    cfg_of(gh_token="ghp_X", gh_login="alice"),
+    vargs(platform="gitee,github")))
+check("9m 两个平台都改了", len(st.patches()) == 2, f"{len(st.patches())} 次")
+check("9m 一个平台一个地址",
+      len(set(r["url"].split("?")[0] for r in st.patches())) == 2,
+      f"{[r['url'].split('?')[0] for r in st.patches()]}")
+
+G.INTERACTIVE, G.ask_bool = REAL_INTERACTIVE, REAL_ASK
+G.http_json = fake
+
+print()
+print("=" * 64)
 print(f"结果：{len(passed)} 通过 / {len(failed)} 失败")
 for f in failed:
     print("   FAIL:", f)

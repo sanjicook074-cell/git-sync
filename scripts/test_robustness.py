@@ -568,6 +568,56 @@ check("救回来时报告了通道名", bool(_vb), f"via={_vb!r}")
 
 print()
 print("=" * 60)
+print("13) ignored_top_dirs：排除名单必须问 git，不能猜目录名")
+print("=" * 60)
+
+# 2026-09-27 回归。原实现只看「目录名在 IGNORED_DIR_PROBES 里 且 目录存在」，
+# 于是在九键拼音项目上同时误报（真该推送的 build/ 被说成「已排除」）
+# 与漏报（.workbuddy/ 确实被排除却没出现）。
+_d13 = BASE / "igdirs"
+(_d13 / "build").mkdir(parents=True)
+(_d13 / "dist").mkdir()
+(_d13 / ".cache").mkdir()
+(_d13 / "src").mkdir()
+(_d13 / "build" / "make.py").write_text("print(1)\n", encoding="utf-8")
+(_d13 / "dist" / "index.html").write_text("<html></html>\n", encoding="utf-8")
+(_d13 / ".cache" / "x.bin").write_text("junk\n", encoding="utf-8")
+(_d13 / "src" / "app.py").write_text("pass\n", encoding="utf-8")
+(_d13 / ".gitignore").write_text("dist/\n.cache/\n", encoding="utf-8")
+for _c in (["git", "init", "-b", "main", "-q"],
+           ["git", "config", "user.name", "T"],
+           ["git", "config", "user.email", "t@e.com"],
+           ["git", "add", "-A"],
+           ["git", "commit", "-q", "-m", "first"]):
+    sh(_c, cwd=str(_d13), env=G.net_env())
+
+_ig = G.ignored_top_dirs(_d13)
+check("真的被排除的目录都列出来了", set(_ig) == {".cache/", "dist/"}, f"-> {_ig}")
+check("⭐ 没被排除的 build/ 不许出现在「已排除」名单里（回归：原来会误报）",
+      "build/" not in _ig, f"-> {_ig}")
+check("没被排除的 src/ 也不出现", "src/" not in _ig, f"-> {_ig}")
+check("结果稳定可重复（连调两次一致）", G.ignored_top_dirs(_d13) == _ig)
+
+# 反向对照：把 .gitignore 换成不排除 dist/，它就该消失 —— 证明确实是读规则
+(_d13 / ".gitignore").write_text(".cache/\n", encoding="utf-8")
+check("改 .gitignore 后 dist/ 立刻从名单消失（读的是规则，不是名字）",
+      G.ignored_top_dirs(_d13) == [".cache/"], f"-> {G.ignored_top_dirs(_d13)}")
+
+# 没有 .gitignore 的仓库：一个都不该出现
+_d14 = BASE / "igdirs2"
+(_d14 / "build").mkdir(parents=True)
+(_d14 / "build" / "make.py").write_text("print(1)\n", encoding="utf-8")
+for _c in (["git", "init", "-b", "main", "-q"],
+           ["git", "config", "user.name", "T"],
+           ["git", "config", "user.email", "t@e.com"],
+           ["git", "add", "-A"],
+           ["git", "commit", "-q", "-m", "first"]):
+    sh(_c, cwd=str(_d14), env=G.net_env())
+check("无 .gitignore 时名单为空（不凭空报「已排除」）",
+      G.ignored_top_dirs(_d14) == [], f"-> {G.ignored_top_dirs(_d14)}")
+
+print()
+print("=" * 60)
 print(f"结果：{len(passed)} 通过 / {len(failed)} 失败")
 if failed:
     for f in failed:

@@ -230,6 +230,10 @@ python scripts/git_sync.py --dir ./myproj --platform both --name myproj \
 # 建公开仓库（默认私有）
 python scripts/git_sync.py --dir ./myproj --account <地址> --yes --public
 
+# 把**已经建好**的仓库改成公开（已存在的库不会被动改，所以要用专门的入口）
+python scripts/git_sync.py --visibility public --name myproj --dry-run   # 先看计划
+python scripts/git_sync.py --visibility public --name myproj --yes       # 再改，改完自动读回确认
+
 # 同步三件套：查状态 / 拉取 / 双平台对齐
 python scripts/git_sync.py --status
 python scripts/git_sync.py --pull
@@ -251,7 +255,8 @@ python scripts/git_sync.py --intro
 | `--account <地址>` | 目标账号主页地址。**可给多次**（每平台一个） |
 | `--name <名称>` | 远端仓库名，默认取目录名 |
 | `--platform gitee\|github\|both` | 目标平台 |
-| `--private` / `--public` | 仓库可见性（默认私有） |
+| `--private` / `--public` | **建库那一刻**的可见性（默认私有） |
+| `--visibility public\|private` | 改**已存在**仓库的可见性；改完读回确认，非交互要 `--yes` |
 | `--dry-run` | 只体检出计划，**不碰远端** |
 | `--yes` | 绝不询问，全自动 |
 | `--proto https\|ssh` | 推送协议，默认 https |
@@ -275,7 +280,8 @@ python scripts/git_sync.py --intro
 | 镜像别人的仓库时，上游被改掉 | 从别的平台 `clone` 下来的仓库本来就跟踪着原来的平台；推完新平台后，上游**保持不动**，并在输出里告诉你「原本跟踪 X，保持不动」——裸跑 `git pull` 仍然拉原来那个平台 |
 | 静默失败 | **不采信 git 的退出码**——推送后跑 `git ls-remote` 比对远端 SHA 与本地 HEAD，一致才算成功 |
 | 可见性没生效 | **不采信建库接口的返回**——建完读回来核对，不一致就用 PATCH 补正（Gitee 的建库接口会静默忽略可见性参数，实测 5 种写法全无效） |
-| 擅自改动已有仓库 | 只纠正**本次刚建出来**的仓库。已存在的仓库**绝不改设置**，只报告差异 |
+| 擅自改动已有仓库 | 只纠正**本次刚建出来**的仓库。已存在的仓库**绝不改设置**，只报告差异。要改已有的库只能走专门的 `--visibility`，而且改完**再读回确认**——`200` 不算证据 |
+| 手滑把私库变成公开 | 转公开是**不可逆的暴露**，所以：非 `--yes` 时不问就**直接拒**（一个仓库都不动）；问了的话**默认值是「否」**（回车 = 不改）；并明确告诉你**公开的是整个提交历史**，不只是当前这份文件 |
 | 脚本卡住不返回 | 全程关闭交互式提示（`GIT_TERMINAL_PROMPT=0`、`GCM_INTERACTIVE=Never`、清空 credential.helper），**永不弹窗、永不等待输入** |
 | 半截操作 | 提交和推送在最后一步才开始，`Ctrl+C` 退出不会留下半截状态 |
 | 拉取把别人的提交弄丢 | `--pull` **只做快进**，分叉一律停下 |
@@ -327,13 +333,13 @@ rebase 由你决定）· **force push（一行都没有）** · 替你 stash 或
 ## 开发：跑测试
 
 ```bash
-python scripts/test_robustness.py     # 79 项：网络降级、IP 候选、refs 核对、远端复用、删除项、代理冒充认证失败、上游不被顶掉、校验错误不丢
+python scripts/test_robustness.py     # 85 项：网络降级、IP 候选、refs 核对、远端复用、删除项、代理冒充认证失败、上游不被顶掉、校验错误不丢、被排除目录由 git 判定
 python scripts/test_wizard.py         # 103 项：四问向导、账号解析、按平台核对、可见性核对
-python scripts/test_repo_create.py    # 53 项：建库 API 契约、可见性纠正
+python scripts/test_repo_create.py    # 94 项：建库 API 契约、可见性纠正、改已存在仓库的可见性
 python scripts/test_sync_modes.py     # 60 项：八种同步关系、拉取/对齐的拒绝路径、只读性
 ```
 
-共 **295 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
+共 **342 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
 测试里插了一根钉子：`main()` 一旦试图访问真实网络就**直接抛异常**——
 避免"漏打一个桩"让测试悄悄降级成假绿。
 

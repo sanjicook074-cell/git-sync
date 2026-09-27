@@ -43,7 +43,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "1.13.0"
+VERSION = "1.15.0"
 
 CONFIG_PATH = Path.home() / ".workbuddy" / "git-sync.json"
 
@@ -251,9 +251,6 @@ Thumbs.db
 *.log
 .cache/
 """
-
-IGNORED_DIR_PROBES = ("data", "datasets", "outputs", "runs", "weights",
-                      "dist", "build", ".venv", "venv", "node_modules", "wandb")
 
 SECRET_FILENAME_PATTERNS = [
     (r"^\.env(\.(?!example|sample|template|dist)[\w.-]+)?$", ".env 环境变量文件"),
@@ -1094,6 +1091,40 @@ def stage_all(root):
 # --------------------------------------------------------------------------
 # 体检（对暂存区）
 # --------------------------------------------------------------------------
+def ignored_top_dirs(root):
+    """哪些顶层目录**真的**被 .gitignore 排除了 —— 问 git，别猜目录名。
+
+    2026-09-27 修。原实现只做了一件事：拿 IGNORED_DIR_PROBES 里的名字去
+    `(root / probe).is_dir()`，存在就宣布「已被 .gitignore 排除（体积不计入）」。
+    那既不是判据，而且两个方向都会错 —— 实测在九键拼音项目上同时踩中：
+
+      ① **误报**（更坏）：项目里 `build/` 是真的要推送的（88 个文件，
+         含 86 条 mp3 共 712 KB，明确计入了「合计 1.9 MB」这一行），
+         报告却照样把它列进「已被排除、体积不计入」——**报表说的和做的是反的**。
+      ② **漏报**：名字不在候选表里的（那次是 `.workbuddy/`）一个都不出现，
+         用户看不到"这几样没上去"。
+
+    两种错都会让人对"到底推了什么"形成错误印象。这属于本技能最反对的一类
+    （§7.8 / §7.10 / §7.12）：**报告不能比实情乐观，也不能比实情悲观** ——
+    尤其不能出现"读起来像结论、其实是猜的"那种句子。
+
+    正确做法是直接读 git 的判定（`--ignored` 的 traditional 模式给目录级输出）：
+        !! .workbuddy/
+        !! _check/_tmp_time.js
+        !! dist/
+    只取**带尾斜杠**的条目（即目录）的顶层名。名单完全由规则决定，不预设候选表。
+    """
+    out = git_out(["status", "--porcelain", "--ignored", "-z"], root)
+    names = set()
+    for item in out.split("\0"):
+        if not item.startswith("!! ") or not item.endswith("/"):
+            continue
+        top = item[3:].strip().rstrip("/").split("/")[0]
+        if top:
+            names.add(top + "/")
+    return sorted(names)
+
+
 def scan_staged(root, files):
     report = {"count": len(files), "total_bytes": sum(s for _, s in files),
               "big": [], "secrets_name": [], "secrets_content": [],
@@ -1141,9 +1172,7 @@ def scan_staged(root, files):
             report["secrets_content"].append(hit)
 
     report["big"].sort(key=lambda d: -d["size"])
-    for probe in IGNORED_DIR_PROBES:
-        if (root / probe).is_dir():
-            report["ignored_dirs"].append(probe + "/")
+    report["ignored_dirs"] = ignored_top_dirs(root)
     return report
 
 
@@ -1989,6 +2018,133 @@ def align_execute(cfg, args, ctx, push_list):
     return code
 
 
+def run_visibility_mode(cfg, args):
+    """`--visibility public|private`：改**已存在**仓库的可见性。
+
+    为什么要单独一个入口，而不是让 `--public` 顺带管这件事：
+
+    `--public` / `--private` 只管**建库那一刻**，而且只对"刚建出来"的仓库做
+    纠正（§2 第 22 条：Gitee 建库接口会静默忽略 `private`，请求公开也建成私有）。
+    对**已经存在**的仓库，主流程按约定一律不动 —— 把一个现成的私库悄悄转成公开，
+    比"没改成"严重得多。所以"要把已经建好的库转公开"必须走这个显式入口。
+
+    这个入口本身也带一道闸：不 `--yes` 就一定要在终端敲一次确认。
+    真正危险的方向（私有 → 公开）还会额外说清代价：公开的是**整个提交历史**。
+    """
+    want_private = args.visibility == "private"
+    label = "私有" if want_private else "公开"
+    head(f"git-sync —— 改仓库可见性 → {label}")
+
+    # ---- 改哪一个仓库 ----
+    repo = (args.name or "").strip()
+    if not repo:
+        if args.dir:
+            repo = Path(args.dir).expanduser().resolve().name
+            info(f"没给 --name，按 --dir 的目录名取仓库名：{repo}")
+        else:
+            die("要改哪个仓库？加 --name <仓库名>"
+                "（或用 --dir <项目目录>，我按目录名推断）")
+    if "/" in repo or "\\" in repo or repo in (".", ".."):
+        die(f"--name 要的是仓库名，不是路径：{repo}")
+
+    # ---- 哪个账号 / 哪些平台 ----
+    owners, platforms = {}, []
+    if args.account:
+        for raw in args.account:
+            p, lg, _rp, err = parse_account(raw)
+            if not lg:
+                die(f"--account 解析失败：{err}")
+            if not p:
+                die("账号地址要带平台，例如 https://gitee.com/用户名/")
+            owners[p] = lg
+            platforms.append(p)
+    if args.platform:
+        platforms = [p for p in re.split(r"[,\s]+", args.platform.strip()) if p]
+    if not platforms:
+        # 没指定就挑"令牌和账号都齐"的平台 —— 否则跑一半才发现缺登录态。
+        platforms = [p for p in PLATFORMS
+                     if cfg["tokens"].get(p) and cfg["logins"].get(p)]
+        if not platforms:
+            die("没有可用的平台：先 `--set-token <平台>=<令牌>` 配一个")
+        info(f"没指定平台，按已配好的账号来：{', '.join(platforms)}")
+    seen, uniq = set(), []
+    for p in platforms:
+        if p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    platforms = uniq
+
+    info(f"仓库：{repo}")
+    out()
+
+    code = SYNC_EXIT_IN_SYNC
+    todo = []
+    for p in platforms:
+        owner = owners.get(p) or cfg["logins"].get(p) or ""
+        token = cfg["tokens"].get(p) or ""
+        if not owner or not token:
+            bad(f"{p}：缺{'账号' if not owner else '令牌'}，跳过")
+            info(f"      配令牌：python git_sync.py --set-token {p}=<你的令牌>")
+            code = max(code, SYNC_EXIT_NEEDS_HUMAN)
+            continue
+        cur, err = repo_visibility(p, owner, repo, token)
+        if cur is None:
+            # "读不出来" 不等于 "是公开"：这里必须停下，不能靠猜。
+            bad(f"{p}：读不到 {owner}/{repo} 的可见性 —— {err}")
+            info("      可能原因：仓库不存在、或令牌没有这个仓库的权限")
+            code = max(code, SYNC_EXIT_UNREACHABLE)
+            continue
+        if cur == want_private:
+            ok(f"{p}：{owner}/{repo} 已经是{label}，不用改")
+            continue
+        todo.append((p, owner, token, "私有" if cur else "公开"))
+
+    if not todo:
+        out()
+        info("没有任何仓库需要改动。")
+        return code
+
+    out()
+    for p, owner, _t, now in todo:
+        info(f"{p}：{owner}/{repo}   {now} → {label}")
+    if not want_private:
+        warn("转公开之后，**任何人**（含搜索引擎爬虫）都能看到它的"
+             "**全部提交历史** —— 不只是当前这份文件，之前提交过、"
+             "后来又删掉的内容同样会被翻出来。")
+    if args.dry_run:
+        info("演练模式：以上只是计划，没有改动任何仓库。")
+        return code
+
+    if not args.yes:
+        if not INTERACTIVE:
+            die(f"要把 {len(todo)} 个仓库改成{label}？非交互模式下必须显式加 --yes 确认"
+                f"（想先看清楚会怎么变，用 --dry-run）")
+        if not ask_bool(f"确认把上面 {len(todo)} 个仓库改成{label}？", False):
+            info("已取消，一个都没有改。")
+            return code
+
+    out()
+    for p, owner, token, now in todo:
+        done, err2 = api_set_visibility(p, owner, repo, token, want_private)
+        if not done:
+            bad(f"{p}：改成{label}失败 —— {err2}")
+            code = max(code, SYNC_EXIT_NEEDS_HUMAN)
+            continue
+        # 写完**必读回**：Gitee 有"返回成功却没生效"的前科（§2 第 22 条），
+        # 而且 PATCH 的返回值本身也可能滞后 —— 拿它当结论就是自欺。
+        after, err3 = repo_visibility(p, owner, repo, token)
+        if after is None:
+            warn(f"{p}：改完了，但读回来确认不了（{err3}）—— 到网页看一眼")
+            continue
+        if after == want_private:
+            ok(f"{p}：{owner}/{repo}   {now} → 已确认为{label}")
+        else:
+            bad(f"{p}：PATCH 返回成功，但读回来**仍是{'私有' if after else '公开'}**"
+                f" —— 接口没生效，去网页仓库设置里改")
+            code = max(code, SYNC_EXIT_NEEDS_HUMAN)
+    return code
+
+
 # --------------------------------------------------------------------------
 # 配置展示
 # --------------------------------------------------------------------------
@@ -2063,6 +2219,9 @@ def build_parser():
                          "不会替你 stash 或合并）")
     ap.add_argument("--align", action="store_true",
                     help="双平台补推：只推确实落后的一方，永不 force push")
+    ap.add_argument("--visibility", choices=["public", "private"],
+                    help="改**已存在**仓库的可见性（--public/--private 只管建库那一刻）。"
+                         "改之前必读回确认；非交互模式要配 --yes，先 --dry-run 可只看计划")
     ap.add_argument("--version", action="version", version=f"git-sync {VERSION}")
     return ap
 
@@ -2113,6 +2272,14 @@ def main():
     if args.intro:
         print_intro()
         return
+
+    # ---- 改可见性模式（--visibility）----
+    # 跟"建库时定可见性"是两码事：那条路只纠正**刚建出来**的仓库，
+    # 已存在的仓库按约定不动（防把私库误转公开）。要把现成的库转公开，
+    # 只能走这个显式、需确认的入口。放在这儿的另一个原因：它不碰本地仓库，
+    # 不需要 --dir 是个 git 仓库，也不该被向导的四问拦住。
+    if args.visibility:
+        sys.exit(run_visibility_mode(cfg, args))
 
     # ---- 同步模式（--status / --pull / --align）----
     # 这三个跟"从零建库并推送"是两码事：目标目录、平台、账号、仓库名全都
