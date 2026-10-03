@@ -485,6 +485,22 @@ check("9m 一个平台一个地址",
       len(set(r["url"].split("?")[0] for r in st.patches())) == 2,
       f"{[r['url'].split('?')[0] for r in st.patches()]}")
 
+# --- 9n ⭐ `--platform both` 必须展开成两个真平台名 ---
+#   踩过（2026-10-03，推 douyin-publish 时）：这个入口**漏抄了主流程里那句展开**，
+#   于是 "both" 被当成一个叫 both 的平台，在账号表里查不到 →
+#   报出「both：缺账号，跳过」，把人往「去配令牌」的方向带，
+#   而真实原因是参数根本没展开（现场给足了两个 --account）。
+st = VisStub(private=True)
+G.http_json = st
+code, text = capture(lambda: G.run_visibility_mode(
+    cfg_of(gh_token="ghp_X", gh_login="alice"), vargs(platform="both")))
+check("9n --platform both 展开了（两个平台各发一次 PATCH）",
+      len(st.patches()) == 2, f"{len(st.patches())} 次")
+check("9n ⭐ 不再误报「both：缺账号」", "both：缺账号" not in text, text[-200:])
+check("9n 打到两个不同仓库地址",
+      len(set(r["url"].split("?")[0] for r in st.patches())) == 2,
+      f"{[r['url'].split('?')[0] for r in st.patches()]}")
+
 G.INTERACTIVE, G.ask_bool = REAL_INTERACTIVE, REAL_ASK
 G.http_json = fake
 

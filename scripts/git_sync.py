@@ -2059,7 +2059,17 @@ def run_visibility_mode(cfg, args):
             owners[p] = lg
             platforms.append(p)
     if args.platform:
-        platforms = [p for p in re.split(r"[,\s]+", args.platform.strip()) if p]
+        platforms = [p.lower() for p in re.split(r"[,\s]+", args.platform.strip()) if p]
+        # ★ `both` 必须在这里展开成真平台名。
+        #   不展开的话它会被当成一个叫 "both" 的平台，在下面那张表里查不到账号，
+        #   于是报出一句「both：缺账号，跳过」—— 归因完全指错了方向
+        #   （2026-10-03 实测：明明给足了两个 --account，却被告知缺账号）。
+        #   主流程里早就有这段展开，这个入口是漏抄了一份。
+        if "both" in platforms:
+            platforms = list(PLATFORMS)
+        unknown = [p for p in platforms if p not in PLATFORMS]
+        if unknown or not platforms:
+            die(f"平台不合法：{unknown or platforms}，只能是 gitee / github / both")
     if not platforms:
         # 没指定就挑"令牌和账号都齐"的平台 —— 否则跑一半才发现缺登录态。
         platforms = [p for p in PLATFORMS
@@ -2443,6 +2453,9 @@ def main():
     # ---- 远端 ----
     head("三、准备远端仓库")
     live, logins = [], {}
+    # 新建仓库的可见性**可能纠正失败**：Gitee 拿空仓库没办法（见下面那段注释）。
+    # 推送之后它就不空了，所以留一份待办，推完再补一次。
+    vis_pending, vis_unconfirmed = {}, set()
     for platform in platforms:
         token = tokens.get(platform, "")
         if not token:
@@ -2472,13 +2485,19 @@ def main():
            f"{'（新建）' if is_new else '（已存在，复用）'}")
         # 建库接口不可信：Gitee 会静默忽略可见性参数（见 align_visibility 注释）。
         # 所以建完必须**读回来核对**，不一致就补一刀——这是唯一可靠的路径。
-        _, vis_notes = align_visibility(platform, login, repo_name,
-                                        token, private, is_new)
+        vis_ok, vis_notes = align_visibility(platform, login, repo_name,
+                                             token, private, is_new)
         for line in vis_notes:
             if line.startswith(("⚠️", "改成", "读不到")):
                 warn(line)
             else:
                 info(line)
+        # ★ 新建的 Gitee 仓库**此刻是空的**，PATCH 可见性会被平台拒：
+        #   实测 422「空仓库不支持设置为公开仓库」。而推送之后它就不空了 ——
+        #   这里不留一手，最后会打印一句「公开」而仓库其实还是私有的
+        #   （2026-10-03 实测踩到，且仓库是空的时候没有任何 API 能绕过）。
+        if is_new and not vis_ok:
+            vis_pending[platform] = (login, private)
         live.append(platform)
 
     if not live:
@@ -2501,6 +2520,19 @@ def main():
             info("已用 git ls-remote 核对远端 refs 与本地 HEAD 一致")
             if note:
                 warn(note)
+            # 建库时没纠正成功的可见性，趁着"仓库已经不空了"补最后一刀。
+            # 这才是唯一能让 Gitee 公开仓库真的公开的时机。
+            if platform in vis_pending:
+                owner2, private2 = vis_pending.pop(platform)
+                ok2, notes2 = align_visibility(platform, owner2, repo_name,
+                                               tokens[platform], private2, True)
+                for line in notes2:
+                    if line.startswith(("⚠️", "改成", "读不到")):
+                        warn(line)
+                    else:
+                        info(line)
+                if not ok2:
+                    vis_unconfirmed.add(platform)
         else:
             bad(f"{platform} 推送失败")
             info(err.replace("\n", "\n         ")[:800])
@@ -2523,11 +2555,25 @@ def main():
 
     # ---- 汇总 ----
     head("完成")
+    # ★ 汇总里那行可见性必须反映**核对过的**事实，不能只是复述我们要什么。
+    #   2026-10-03 实测：Gitee 新建的库因为当时是空的、PATCH 被拒，仓库实际仍是私有，
+    #   而汇总照样打印「公开」—— 一句话就把人送进误区。核对不上就明写出来。
+    vis_unconfirmed |= set(vis_pending)
+    vis_label = "私有" if private else "公开"
+    if vis_unconfirmed:
+        vis_label += f"（⚠️ {'、'.join(sorted(vis_unconfirmed))} 未核对上）"
     info(f"仓库 {repo_name} · 分支 {branch} · "
-         f"{'私有' if private else '公开'} · 用时 {time.time() - start:.1f} 秒")
+         f"{vis_label} · 用时 {time.time() - start:.1f} 秒")
     for platform, pushed in results:
         info(f"{platform:<7} {'已同步' if pushed else '失败'}  "
              f"{web_url(platform, cfg['logins'][platform], repo_name)}")
+    if vis_unconfirmed:
+        out()
+        for platform in sorted(vis_unconfirmed):
+            warn(f"{platform} 的可见性**没有核对成功** —— 上面那行不要当真，")
+            warn(f"       到网页仓库设置里看一眼，或跑："
+                 f"python git_sync.py --visibility {'private' if private else 'public'} "
+                 f"--name {repo_name} --account https://{platform}.com/{cfg['logins'][platform]}/ --yes")
     out()
     info("以后同步：在本目录运行  python git_sync.py --yes")
     if not args.remember_credentials and proto == "https":

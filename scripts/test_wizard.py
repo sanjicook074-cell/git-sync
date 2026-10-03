@@ -337,10 +337,12 @@ print("10) 集成：跑完整的 main()，看取值有没有真的流到建库�
 print("=" * 66)
 
 
-def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None):
+def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None,
+             align_seq=None):
     """带桩跑完整 main()：网络层、建库、推送全部替换，输出被收集。
 
     login 可以给 str，也可以给 {平台: 账号名} —— 两个平台账号名不同时要用后者。
+    align_seq 给一串 (是否已确认, 提示语列表)，按调用次序返回；不给就永远成功。
     """
     msgs, calls = [], {}
     G.out = lambda m="": msgs.append(str(m))
@@ -363,7 +365,10 @@ def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None):
         rec = dict(platform=platform, repo=repo, branch=branch, login=login_)
         calls["push"] = rec
         calls.setdefault("pushes", []).append(rec)
+        calls.setdefault("order", []).append("push")
         return True, "", "直连", ""
+
+    _align_n = {"n": 0}
 
     def fake_align(platform, owner, repo, token, private, is_new):
         calls["align"] = dict(platform=platform, owner=owner, repo=repo,
@@ -371,7 +376,12 @@ def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None):
         calls.setdefault("aligns", []).append(dict(platform=platform, owner=owner,
                                                    repo=repo, private=private,
                                                    is_new=is_new))
-        return True, []
+        calls.setdefault("order", []).append("align")
+        if not align_seq:
+            return True, []
+        i = min(_align_n["n"], len(align_seq) - 1)
+        _align_n["n"] += 1
+        return align_seq[i]
 
     def forbidden_http(*a, **k):
         """守卫：main() 全程不该再碰真实网络。
@@ -534,6 +544,33 @@ msgs9, calls9, _, _ = run_main(
 pushed9 = [c["platform"] for c in calls9.get("pushes", [])]
 check("对不上的平台被拦下", has(msgs9, "github 账号对不上"), "")
 check("对的上的平台不受牵连（照样推 gitee）", pushed9 == ["gitee"], f"{pushed9}")
+
+# ── 10x ⭐ 新建仓库的可见性第一次没纠正成功 -> 推送之后必须补一刀 ──
+#   踩过（2026-10-03，推 douyin-publish 时）：Gitee 新建的仓库**此刻是空的**，
+#   PATCH 可见性会被平台拒（实测 422「空仓库不支持设置为公开仓库」）。
+#   而推送之后它就不空了 —— 不补这一刀，汇总里会打印「公开」而仓库其实还是私有的
+#   （当时实测匿名 GET 得到 404，而脚本满口「公开」）。
+msgs_x, calls_x, _, _ = run_main(
+    ["--name", "demo", "--account", "https://gitee.com/zhangsan/", "--public"],
+    extra_cfg={"tokens": {"gitee": "tok", "github": ""}},
+    align_seq=[(False, ["改成公开失败：HTTP 422 空仓库不支持设置为公开仓库"]),
+               (True, [])])
+check("10x ⭐ 可见性对齐跑了两次（建库后一次 + 推送后一次）",
+      calls_x.get("order") == ["align", "push", "align"], f"{calls_x.get('order')}")
+check("10x 补的那一刀仍按「刚建出来的仓库」走（is_new=True）",
+      all(a["is_new"] for a in calls_x.get("aligns", [])), f"{calls_x.get('aligns')}")
+
+# ── 10y ⭐ 两次都改不动 -> 汇总里那行必须说「未核对上」，不能照样写「公开」 ──
+msgs_y, calls_y, _, _ = run_main(
+    ["--name", "demo", "--account", "https://gitee.com/zhangsan/", "--public"],
+    extra_cfg={"tokens": {"gitee": "tok", "github": ""}},
+    align_seq=[(False, ["改成公开失败：HTTP 422 空仓库不支持设置为公开仓库"]),
+               (False, ["改成公开失败：HTTP 422 空仓库不支持设置为公开仓库"])])
+check("10y 重试过（不是只试一次就放弃）",
+      len(calls_y.get("aligns", [])) == 2, f"{len(calls_y.get('aligns', []))}")
+check("10y ⭐ 汇总明说「未核对上」", has(msgs_y, "未核对上"), "")
+check("10y 给出可执行的补救命令（--visibility）",
+      has(msgs_y, "--visibility public"), "")
 
 print()
 print("=" * 66)
