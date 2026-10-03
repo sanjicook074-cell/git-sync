@@ -757,6 +757,8 @@ GitHub `helloai`）不能一次跑完——必须分两次、各带各的 `--nam
 | 建库报 `已存在同地址仓库(忽略大小写)` | 远端已有同名仓库 | 脚本已自动复用，不报错 |
 | 建库报 `422 当前账户尚未认证身份` | **Gitee 实名认证门槛**，无 API 可绕 | 去「个人设置 → 帐号信息」完成实名认证后重跑 |
 | 建库报 `401 Access token does not exist` / `Bad credentials` | 令牌无效或已删 | 重新生成令牌，注意只显示一次 |
+| `--platform both`：一个平台推成功，另一个报 `401 Bad credentials` | 那个平台的令牌失效了（**和网络无关**） | 判定顺序：**先直连 + 走代理各打一次 `api.*/<user>` 端点** —— 两条路返回同一个 401 才好断定是令牌（若只有一条 401，就是代理/链路问题，见上两条）。拿到新令牌后只改 `~/.workbuddy/git-sync.json` 的 `tokens.<平台>`，再单平台补推：`--platform github --yes`。**本地 commit 是完整的，不需要重做任何东西** |
+| 想确认「凭据管理器里到底存了什么」 | ⚠️ **别用 `git push` 的报错反推**。实测踩过：`git push <remote>` 报 `Invalid username or token`，于是判定"凭据管理器里那份也失效了" —— **是错的**，用 `git credential fill` 一看本机**根本没有该 host 的条目**（报 `could not read Username`）。git-sync 走 `auth_url()` **把令牌拼进 URL**，本来就不依赖凭据助手 | 直接看：`printf 'protocol=https\nhost=github.com\n\n' \| GIT_TERMINAL_PROMPT=0 git credential fill`（**输出的 password 别直接打印，先打码核对长度与前后缀**）。写回：`git credential approve`（**别用 `reject`，它会删掉该 host 全部条目**）。写凭据助手只是给"手动 git push"兜底，对脚本非必需 |
 | 建库报 `403 您的账户已被限制创建仓库` | 账号被平台限制 | 联系平台申诉；临时可先在网页建好库再让脚本推送 |
 | 报 `gitee 账号对不上：你给的地址是 A，但这枚令牌属于 B` | 地址与令牌不是同一个账号 | 换成该账号自己的令牌，或把 `--account` 改成正确地址。**这是防误建到别人账号下的保护** |
 | `--platform both` 时某个平台被跳过 / 报"账号对不上"但它其实没错 | v1.6.0 及以前账号核对是**单值**的，两个平台不同名时必然误判一个 | 升级到 v1.7.0（按平台核对），并**每个平台各给一个 `--account`**：`--account https://gitee.com/A/ --account https://github.com/B/` |

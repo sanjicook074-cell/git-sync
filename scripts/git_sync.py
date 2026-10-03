@@ -43,7 +43,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "1.15.0"
+VERSION = "1.15.1"
 
 CONFIG_PATH = Path.home() / ".workbuddy" / "git-sync.json"
 
