@@ -12,6 +12,10 @@ env/
 *.local.json
 .git-sync.json
 
+# 本机专用的「不许出现」词清单（账号名等）——
+# check_clean.py 会自动读它；它绝不能进仓库（否则正是它要防的东西）
+.deny_names.local.txt
+
 # 编辑器 / 系统
 .idea/
 .vscode/

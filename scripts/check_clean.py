@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import pathlib
 import re
+import subprocess
 import sys
 
 # ---- 要扫的文本类型（其余按扩展名跳过，避免二进制误判）----
@@ -112,6 +113,31 @@ def scan_text(path: pathlib.Path, extra_deny):
     return hits
 
 
+def distributable_files(root: pathlib.Path):
+    """**会被分发出去**的文件清单 —— 优先问 git，问不到才退回走全目录。
+
+    2026-10-13 加。起因是自查自己报自己：技能目录里有一份**本机专用、被
+    `.gitignore` 挡住**的 `.deny_names.local.txt`（"不许出现的词"清单，里面正是
+    账号名），而原来用的是 `root.rglob("*")` 走全目录 —— 于是清单里那几个词
+    被自己报成 4 处命中，把"干净"这个信号淹掉了。**报表喊狼来了，人就会开始
+    忽略报表**，这属于本技能最反对的一类。
+
+    判据必须指向"真实范围"，所以这里问 git 要「已跟踪 + 未跟踪且未被忽略」：
+        git ls-files -co --exclude-standard -z
+    这既排除了 `.gitignore` 挡住的本机文件，也保留了"已跟踪但恰好被 .gitignore
+    匹配"的文件（它们照样会被分发，必须扫）。**不是**另定一套忽略规则去猜。
+    不在 git 仓库里（或没有 git）时才退回 `rglob`，并在调用处说明范围。
+    """
+    try:
+        p = subprocess.run(["git", "ls-files", "-co", "--exclude-standard", "-z"],
+                           cwd=str(root), capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if p.returncode != 0:
+        return None
+    return [root / n for n in p.stdout.decode("utf-8", "replace").split("\0") if n]
+
+
 def scan_junk(root: pathlib.Path):
     """返回 [(类别, 相对路径)]"""
     found = []
@@ -125,6 +151,32 @@ def scan_junk(root: pathlib.Path):
         elif p.is_file() and p.suffix.lower() in JUNK_EXT:
             found.append(("不该分发的文件", p.relative_to(root)))
     return sorted(set(found), key=lambda x: str(x[1]))
+
+
+def local_deny_words():
+    """读本机专用、**不进仓库**的拉黑词清单。
+
+    2026-10-13 加。起因是一个反复复发的坑：账号名这类"只有本机知道、又必须
+    一个都不能出现在公开文档里"的词，靠人在命令行 `--deny` 手动传是**靠不住的** ——
+    实测 2026-09-23 那次清理了 94 处，之后每写一段新的实测记录（§7.10 / §7.12 / §7.15）
+    就又把账号名写回去一次，而默认规则（令牌形状 / 邮箱 / 手机号 / 本机路径）
+    **根本扫不出账号名**，于是三次都悄悄溜过去、直到推送完才发现。
+
+    结构上的解法是把清单**放到分发树外面**：
+      - 文件：与本脚本同级的技能目录下 `.deny_names.local.txt`
+      - 格式：一行一个词，`#` 开头与空行忽略
+      - `.gitignore` 里已挡住它，所以它永远不进仓库
+    这样"哪些词不能出现"这条知识就沉淀在本机，不必每次靠人记着传参。
+    """
+    path = pathlib.Path(__file__).resolve().parent.parent / ".deny_names.local.txt"
+    if not path.is_file():
+        return []
+    words = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            words.append(line)
+    return words
 
 
 def main(argv=None):
@@ -142,18 +194,32 @@ def main(argv=None):
         print(f"[错误] 不是目录：{root}", file=sys.stderr)
         return 2
 
+    # 本机清单 + 命令行给的两份都算上（去重，命令行排在后、结果里能看出是显式给的）
+    deny = list(dict.fromkeys(local_deny_words() + list(args.deny)))
+
     if not args.quiet:
+        shown = "，".join(deny) if deny else "无"
+        src = "（含 .deny_names.local.txt）" if local_deny_words() else ""
         print(f"扫描目录：{root}")
-        print(f"规则 {len(RULES)} 条 + 结构检查，自定义拉黑词 {args.deny or '无'}\n")
+        print(f"规则 {len(RULES)} 条 + 结构检查，自定义拉黑词 {shown}{src}\n")
+
+    files = distributable_files(root)
+    if files is None:
+        scope = "目录下所有文件（此目录不是 git 仓库，或没装 git）"
+        files = [p for p in sorted(root.rglob("*")) if p.is_file()]
+    else:
+        scope = "git 会分发的文件（已跟踪 + 未跟踪且未被 .gitignore 排除）"
+    if not args.quiet:
+        print(f"扫描范围：{scope}")
 
     file_hits, n_files = [], 0
-    for p in sorted(root.rglob("*")):
+    for p in files:
         if not p.is_file() or not is_text_file(p):
             continue
         if any(s.lower() in JUNK_DIRS for s in p.parts):
             continue
         n_files += 1
-        for h in scan_text(p, args.deny):
+        for h in scan_text(p, deny):
             file_hits.append((p.relative_to(root),) + h)
 
     junk = scan_junk(root)

@@ -144,8 +144,8 @@ python scripts/git_sync.py --pull --align
 ```
   本地：main · edeb6e28 · 工作区干净
 
-  gitee   sweetsocks/git-sync-drill           本地落后 1 个提交   edeb6e28
-  github  sanjicook074-cell/git-sync-drill    一致                782822fd
+  gitee   zhangsan/git-sync-drill             本地落后 1 个提交   edeb6e28
+  github  lisi/git-sync-drill                 一致                782822fd
 ```
 
 **它怎么看"谁新谁旧"**：只看**合并基是不是祖先**——不看提交数、更不看时间戳。
