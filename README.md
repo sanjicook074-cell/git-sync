@@ -312,6 +312,7 @@ python scripts/git_sync.py --intro
 | **从别的平台 clone 下来镜像过去后，`git pull` 拉的是哪儿？** | 老版本推完会把上游**无条件**改成新推的远端（如 `mirror`）——裸跑 `git pull` 就默默换了平台 | 升级到 v1.13.0：已有上游**保持不动**，并打印「原本跟踪 `origin`，保持不动」。手动还原：`git config branch.<分支>.remote origin` |
 | **镜像一个已有仓库时，`--dry-run` 说「暂存区是空的，没有任何文件会被推送」** | 不是错误：clone 下来工作区本来就干净，而**密钥体检是针对暂存区做的**——所以它这次其实**什么都没扫** | 另外单独扫一遍：`python scripts/check_clean.py --dir <目录>`。**别把"空转的体检"当成"体检通过"** |
 | 体检报告说「已被 .gitignore 排除：**某个大目录**」，可那个目录里的文件**明明在"将推送 N 项"的清单里** | 早期版本的报表会**把 git 给的忽略路径截成顶层名**：只排除了 `tools/子目录/__pycache__/`，却被报成整个 `tools/`。同一屏两行自相矛盾 | 升级到 v1.15.2。自诊：`git status --porcelain --ignored -z \| tr '\0' '\n' \| grep '^!!'` 看真相。**别因为这个去改 `.gitignore`** |
+| 推送说成功、远端 SHA 也核对一致，可去读线上文件**发现是旧版本** | ⚠️ **`raw.githubusercontent.com` 有 CDN 缓存（约 5 分钟）** —— 你读到的是缓存，不是仓库。**走缓存的"读回"不算读回** | 改用 API 读内容并比 **blob sha**（`GET .../contents/<路径>`，两端 sha 相同才是真一致）。2026-10-13 实测：raw 读到 GitHub 是旧版、API 一读两端一致——推送没问题，**别去重推** |
 
 ---
 
