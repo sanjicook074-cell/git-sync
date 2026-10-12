@@ -43,7 +43,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "1.15.5"
+VERSION = "1.15.6"
 
 CONFIG_PATH = Path.home() / ".workbuddy" / "git-sync.json"
 
@@ -133,11 +133,24 @@ def github_ips(limit=4):
 NET_ERROR_HINTS = ("schannel", "handshake", "proxy", "timed out", "timeout",
                    "could not resolve", "unable to access", "failed to connect",
                    "server closed abruptly", "connection reset", "connection",
-                   "network is unreachable", "empty reply")
+                   "network is unreachable", "empty reply",
+                   # ★ 2026-10-13 实测补：**Python 侧**的 API 调用（http_json）失败时，
+                   #   报出来的是 `URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]
+                   #   EOF occurred in violation of protocol>` —— 上面那一串**一条都不命中**，
+                   #   于是 is_network_error() 判它"不是网络问题"，界面上就写成「令牌校验失败」。
+                   #   凡是 TLS 层面的中断都归这一类（握手前后都会出现）。
+                   "ssl", "eof occurred", "unexpected_eof", "urlopen error",
+                   "connection aborted", "connection reset by peer",
+                   "remote end closed", "incompleteread")
 
 # 单次推送超时 / 全部重试的总时长上限（避免网络不通时拖太久）
 PUSH_ATTEMPT_TIMEOUT = 150
 PUSH_TOTAL_BUDGET = 420
+
+# 「读不到令牌所属账号」若是网络类错误，重试几次再退到用户给的账号。
+# 单列成常量是为了测试能把它调成 0 —— 否则每两条用例白等 1.6 秒。
+LOGIN_RETRY_TIMES = 2
+LOGIN_RETRY_SLEEP = 0.8
 
 
 def net_env(strip_proxy=False):
@@ -2471,9 +2484,40 @@ def main():
         if not token:
             continue
         login, err = api_login(platform, token)
+        # ★ 「读不到账号」不等于「令牌有问题」（2026-10-13 实测踩到，v1.15.6）。
+        #   现场：`--platform both` 推 git-sync 自己，Gitee 顺利、**GitHub 被整个跳过**，
+        #   报的原因是 `github 令牌校验失败：URLError: <urlopen error [SSL:
+        #   UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol>`。
+        #   那是 **TLS 读中断**（纯网络抖动），旧代码却把它当令牌问题 → `continue`
+        #   → **建库、推送一步都没试**。而 `push_platform()` 里那 5 级降级阶梯
+        #   （直连 / HTTP1.1 / 清代理 / 绑 IP）**恰恰是治这种抖动的**，
+        #   却因为这一句 continue 永远跑不到。下一次单跑 `--platform github` 一次就过。
+        #   → 所以网络类失败：先重试，再退到「你显式给的账号」继续走；
+        #     只有**认证类**失败才真的停下（那才是"别把库建到别人账号下"的保护）。
+        if not login and is_network_error(err):
+            for _ in range(LOGIN_RETRY_TIMES):
+                time.sleep(LOGIN_RETRY_SLEEP)
+                login, err = api_login(platform, token)
+                if login or not is_network_error(err):
+                    break
         if not login:
-            bad(f"{platform} 令牌校验失败：{err}")
-            continue
+            fallback = (expect_logins.get(platform)
+                        or (cfg.get("logins") or {}).get(platform) or "")
+            if is_network_error(err) and fallback:
+                warn(f"{platform} 读不到令牌所属账号（**网络类**错误，不是令牌问题）：{err}")
+                warn(f"       本轮按你给的账号 {fallback} 继续 —— "
+                     f"账号归属核对这一项**跳过了**；")
+                warn("       推送若报认证错，再回头查令牌")
+                login = fallback
+            elif is_network_error(err):
+                bad(f"{platform} 连不上（网络类错误，不是令牌问题）：{err}")
+                info("       也认不出该推给谁（没给 --account，配置里也没记录过），本轮跳过该平台。")
+                info(f"       稍后只补这一个平台：--platform {platform} "
+                     f"--account https://{HOSTS[platform]}/<账号>/ --yes")
+                continue
+            else:
+                bad(f"{platform} 令牌校验失败：{err}")
+                continue
         expect_login = expect_logins.get(platform)
         if login_mismatch(expect_login, login):
             bad(f"{platform} 账号对不上：你给的地址是 {expect_login}，"

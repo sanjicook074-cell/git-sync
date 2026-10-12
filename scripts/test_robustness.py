@@ -88,6 +88,20 @@ check("不误判 workflow rejected",
       not G.is_network_error(
           "! [remote rejected] main -> main (refusing to allow a Personal Access Token "
           "to create or update workflow)"))
+# ★ 2026-10-13 实测补：Python 侧（http_json）失败时报的是 urlopen 的 TLS 错误，
+#   上面那张表一条都不命中 —— 于是被当成"令牌校验失败"。这几条把它钉住。
+check("识别 SSL EOF（urlopen 口径）",
+      G.is_network_error(
+          "URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] "
+          "EOF occurred in violation of protocol (_ssl.c:1000)>"))
+check("识别 ConnectionResetError",
+      G.is_network_error("ConnectionResetError: [WinError 10054] 远程主机强迫关闭了一个现有的连接"))
+check("识别 ConnectionAbortedError",
+      G.is_network_error("ConnectionAbortedError: [WinError 10053] 你的主机中的软件中止了一个已建立的连接"))
+check("识别 IncompleteRead", G.is_network_error("IncompleteRead(0 bytes read)"))
+check("仍然不误判认证失败",
+      not G.is_network_error("401 Bad credentials") and
+      not G.is_network_error("Access token does not exist"))
 
 check("git_prefix 基础", G.git_prefix("gitee.com") == ["git", "-c", "credential.helper="])
 check("git_prefix 绑 IP", G.git_prefix("github.com", "1.2.3.4")[-2:]

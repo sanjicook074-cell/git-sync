@@ -767,6 +767,7 @@ GitHub `helloai`）不能一次跑完——必须分两次、各带各的 `--nam
 | 绑了 IP 反而更慢/更不通 | 绑的是写死的老 IP 段，与本机 DNS 解析出的段不同 | v1.7.0 起 `github_ips()` 把 DNS 结果排在最前；候选段只排在其后（§2 第 20 条） |
 | GitHub 报**「已自动试过清代理 / 绑 IP 仍失败」** | ⚠️ 这句话**比实情悲观**：v1.9.0 及以前"绑 IP"只试 **1 个**地址，DNS 给的 IP 一挂，整级就废——**并不是所有办法都试过了** | 升级到 v1.9.1（会逐个试 DNS + 候选段）。或按 §2 第 23 条现场扫一个能通的 IP。**别急着去查代理和令牌** |
 | 报 `fatal: Authentication failed for 'https://...'`，但令牌明明是对的（刚用它调过 API） | ⚠️ **可能是代理冒充的**：代理拒绝 CONNECT（407/502）时，git 会把 URL 里带的凭据当**代理**凭据试，被拒后借"认证失败"这句话报出来。v1.10.1 及以前，它会被当成权限问题 → **阶梯第 1 级就断死** | 升级到 v1.11.0（检测到代理时不再一级断死）。自诊：直连探一次看是不是 `CONNECT tunnel failed, response 502`；临时 `unset https_proxy` 再推。**先查代理，别急着换令牌** |
+| **`--platform both` 跑完，一个平台被整段跳过**，报的是 `xxx 令牌校验失败：URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol>`（或 `ConnectionResetError` / `IncompleteRead`） | ⚠️ **那是 TLS 读中断（纯网络抖动），却被写成了"你令牌不对"**。v1.15.5 及以前两处叠加：① `NET_ERROR_HINTS` 认不出 urlopen 这串文案；② 认不出就 `continue` → **建库、推送一步都没试**，而 `push_platform()` 里那 5 级降级阶梯（直连 / HTTP1.1 / 清代理 / 绑 IP）**正是治抖动的，永远跑不到** | 升级到 **v1.15.6**（网络类先重试，再退到 `--account` 给的账号继续，并明说"账号归属核对跳过了"；**只有认证类才停下**）。应急：**单跑那一个平台** `--platform github --yes` —— 实测一次就过。**别去换令牌** |
 | **`--public` 了，Gitee 上建出来还是私有** | **Gitee 建库接口静默忽略 `private`**（5 种写法实测全无效，且返回 201） | v1.9.0 起建完自动读回来核对并 PATCH 补正（§2 第 22 条）。若仓库**本来就已存在**，建库那条路按约定不改它 —— 改用 `--visibility public`（v1.15.0 起，见 §7.14） |
 | 仓库已存在，但可见性跟你要的不一样 | 已存在的仓库**故意不自动改**（防把私库误转公开）——所以"建库参数"这条路对它无效 | v1.15.0 起有专用入口：`--visibility public\|private --name <仓库名> --yes`。它会先读当前状态、改完再读回确认；转公开还会提示"公开的是整个提交历史" |
 | **新建的 Gitee 仓库报 `422 空仓库不支持设置为公开仓库`，可最后汇总还是写着「公开」** | 纠正可见性的那一步在**推送之前**，而此刻仓库还是空的（`auto_init=false`）——Gitee 不让空仓库转公开 | v1.15.1 起推送成功后**自动补一刀**；两次都没成会把汇总改写成「…未核对上」并给出补救命令。手动补：`--visibility public --name <仓库名> --account <地址> --yes` |
@@ -798,7 +799,8 @@ GitHub `helloai`）不能一次跑完——必须分两次、各带各的 `--nam
 | 默认分支显示成 master | 空仓库的平台默认分支 | 到仓库设置里把默认分支改成 main |
 | `.git` 目录残缺（只剩 `info/` 和 `objects/`） | 跑了 `git gc` / `git filter-repo`，safe-delete 拦截内部删除导致状态机错乱 | 动手前先 `cp -r .git` 备份；改用 `git filter-branch`；**永远别在本环境跑 git gc** |
 | 用平台 contents API 复核「某个文件到底传上去没有」，Gitee 那侧报出"文件竟然上去了" | **Gitee 的 contents API 对不存在的路径返回 `HTTP 200` + 空数组，不是 404**（GitHub 才是 404） | 判据要写成「空数组 = 不存在」，**别用 try/except 捕异常**。2026-10-04 实测：复核 `settings.json` 有没有泄漏时被这条反咬过——脚本喊"泄漏了"，再探一次才发现是空数组 |
-| **推送说成功、`ls-remote` 也核对一致，可去读线上文件发现是旧版本** | ⚠️ **`raw.githubusercontent.com` 有 CDN 缓存**（约 5 分钟）。你读到的不是仓库，是缓存 —— **走缓存的"读回"不算读回** | 改用 API 读文件内容并比 **blob sha**：`GET /repos/{owner}/{repo}/contents/{path}`（GitHub）或 `/api/v5/repos/{owner}/{repo}/contents/{path}`（Gitee）。**两家的 `sha` 字段都直接是 git blob sha**（2026-10-13 实测：Gitee 回 `8593823d5c…`，与本地 `sha1("blob <len>\0"+内容)` 逐位相同），所以拿它和 **`git hash-object <file>`** 比即可，**不用自己反算**。两端 sha 相同才是真一致 |
+| **推送说成功、`ls-remote` 也核对一致，可去读线上文件发现是旧版本** | ⚠️ **`raw.githubusercontent.com` 有 CDN 缓存**（约 5 分钟）。你读到的不是仓库，是缓存 —— **走缓存的"读回"不算读回** | 改用 API 读文件内容并比 **blob sha**：`GET /repos/{owner}/{repo}/contents/{path}`（GitHub）或 `/api/v5/repos/{owner}/{repo}/contents/{path}`（Gitee）。**两家的 `sha` 字段都直接是 git blob sha**（2026-10-13 实测），拿它和 **`git hash-object <file>`** 比即可。两端 sha 相同才是真一致。⚠️ **别用手工 `sha1("blob len\0"+字节)` 代替 `git hash-object`** —— 见下一行 |
+| **自己算的本地 blob sha 和远端对不上**，于是以为"没推上去" | ⚠️ **本机 `core.autocrlf=true`**，worktree 里是 CRLF、仓库里存的是 LF —— 你手工 `sha1("blob <len>\0" + worktree 原始字节)` 算的是 **CRLF 那版**，必然对不上。（2026-10-13 实测：SKILL.md worktree 135672 B / 1799 个 CRLF，仓库 blob 133873 B / 0 个 CRLF。）这跟"推送失败"长得一模一样，但**两边平台互相一致**这一点就是破案线索 | **别手工算，用 `git hash-object <file>`** —— 它跟 `git add` 走同一套过滤器（autocrlf / .gitattributes），算出来的才是仓库里那个 sha。判据：**先把两次"读回"对齐到同一个口径，再谈一致不一致** |
 
 ## 6. 接缝（以及为什么不需要另外装技能）
 
@@ -1711,6 +1713,80 @@ CDN、代理、缓存、内容协商，每一个都能让"读回"变成"读了�
 
 ---
 
+
+### 7.18 第十四次：一个 TLS 抖动被写成了「你的令牌不对」（2026-10-13，v1.15.6）
+
+**背景**：用户说「同步」→ 先把 `drug-keeper` 推了两平台（一次过）→ 顺手把本技能那一行文档
+修正也推上去 → **GitHub 被整个跳过了**。
+
+现场是这样：
+
+```
+[OK]   gitee → https://gitee.com/<账号>/git-sync（已存在，复用）
+[出错] github 令牌校验失败：URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]
+       EOF occurred in violation of protocol (_ssl.c:1000)>
+...
+         gitee   已同步
+         github  ← 一个字的推送结果都没有
+```
+
+**两个缺陷叠在一起**：
+
+1. `NET_ERROR_HINTS` 里**一条都命中不了**这段 urlopen 文案 → `is_network_error()` 判它
+   "不是网络问题"（那张表收的全是 **git 侧**的措辞：schannel / handshake / connection…，
+   而这次是 **Python 侧** `http_json` 的 TLS 报错）；
+2. 判成非网络后直接 `continue` → **建库、推送一步都没试**，而 `push_platform()` 里那
+   5 级降级阶梯（直连 / HTTP1.1 / 清代理 / 绑 IP）**正是治这种抖动的，永远跑不到**。
+
+**不信那句报错**，单跑一次补推：`--platform github` → **一次就过**（27.4 秒）。
+→ 报错是假的，网络是真抖。
+
+**修法两道**：
+
+- `NET_ERROR_HINTS` 补上 TLS 类指纹：`ssl` / `eof occurred` / `unexpected_eof` /
+  `urlopen error` / `connection aborted` / `connection reset by peer` /
+  `remote end closed` / `incompleteread`；
+- 校验那一步**分两类**：**网络类**先重试 2 次（`LOGIN_RETRY_TIMES/SLEEP`，测试里置 0），
+  仍不行就**退到 `--account` 给的账号（其次配置里记过的）继续**，并明说
+  "账号归属核对这一项跳过了"；**认证类才停下** —— 那是"别把库建到别人账号下"的保护，
+  不能跟着一起放宽。没有任何可退账号时，报的是「**连不上**（网络类错误，不是令牌问题）」
+  并给出只补这个平台的命令。
+
+**回归 +17 条**（353 → 370）：`test_robustness.py` 88→93（TLS 四类必须认得、
+认证两类仍不许误判）；`test_wizard.py` 108→120（网络类**平台不许被砍**且退到你给的账号、
+认证类仍拦下、没账号可退时明说"连不上"并给补推命令）。
+
+> 这是 §7.10 / §7.12 / §7.13 同一母题的**第四个化身**：
+> **一句"读起来像结论"的报错，把网络问题说成了凭据问题。**
+> 三次的现场不同（代理冒充认证失败 / 校验错误被丢掉 / 报表截短答案），
+> 坏处一样：**自救机制在最需要它的时候不跑，而且失败报告指向错误的排查方向。**
+
+**⭐ 同一轮里第二个发现：我的"独立复核"自己也错了。**
+
+推完 `drug-keeper` 后我按惯例读回核对，四个文件两端 blob sha 全对上。接着推本技能，
+SKILL.md 却对不上 —— 而**两个平台互相一致**。破案靠的就是这一点：
+
+```
+本地 HEAD                 043f80cf2a   ✓ 两边都是
+SKILL.md  gitee=github=   951d1a2bf8   ← 两边一致
+SKILL.md  我算出来的 =     2d82537e0d   ← 只有我不同
+```
+
+根因：本机 **`core.autocrlf=true`**，worktree 里 SKILL.md 是 **CRLF**
+（135672 B / 1799 个 CRLF），仓库里存的是 **LF**（133873 B / 0 个 CRLF）；
+而我手工算的是 `sha1("blob <len>\0" + worktree 原始字节)` —— **CRLF 那一版**。
+`git hash-object SKILL.md` 给出 `951d1a2bf8`，和两个平台**完全一致**。
+
+→ 它在 `drug-keeper` 上**碰巧**是对的，只因为那几个文件是我用工具刚写的、本来就是 LF。
+→ 也就是说：**同一个复核脚本，在 A 项目上给真绿，在 B 项目上就会给假红。**
+教训接在 §7.17 末尾那句后面 —— **"读回来核对"要求两侧先对齐到同一口径**：
+判据要用**走同一套过滤器**的工具（`git hash-object` 会按 autocrlf / `.gitattributes`
+规范化，手工 sha1 不会）。而且这条还有个便宜的破案法：
+**两个平台互相一致、只有本地对不上时，先怀疑自己的算法。**
+
+版本 v1.15.5 → **v1.15.6**；四套测试 **353 → 370 条全过**。
+
+---
 
 ## 8. 分发 / 分享这个技能（2026-09-23 实测）
 

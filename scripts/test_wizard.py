@@ -338,10 +338,12 @@ print("=" * 66)
 
 
 def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None,
-             align_seq=None):
+             align_seq=None, login_fail=None):
     """带桩跑完整 main()：网络层、建库、推送全部替换，输出被收集。
 
     login 可以给 str，也可以给 {平台: 账号名} —— 两个平台账号名不同时要用后者。
+    login_fail 给 {平台: 错误文本}，用来模拟"这个平台读不到账号"；
+    不给就退回默认的 401（**认证类**）。想模拟网络类抖动就传一段带 TLS 指纹的文本。
     align_seq 给一串 (是否已确认, 提示语列表)，按调用次序返回；不给就永远成功。
     """
     msgs, calls = [], {}
@@ -349,7 +351,11 @@ def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None,
 
     def fake_login(platform, token):
         want = login.get(platform, "") if isinstance(login, dict) else login
-        return (want, "") if want else ("", "401 Access token does not exist")
+        if not want:
+            err = (login_fail or {}).get(platform, "401 Access token does not exist")
+            calls.setdefault("login_errs", []).append((platform, err))
+            return "", err
+        return (want, "")
 
     def fake_create(platform, token, name, private, desc):
         calls["create"] = dict(platform=platform, name=name, private=private)
@@ -402,6 +408,7 @@ def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None,
     G.resolve_remotes = fake_resolve
     G.push_platform = fake_push
     G.INTERACTIVE = False
+    G.LOGIN_RETRY_SLEEP = 0        # 别让重试真的睡：用例跑得慢没人爱跑
 
     p = mkproj("MainProj")
     cp = TMP / f"maincfg_{len(msgs)}_{id(argv)}.json"
@@ -544,6 +551,61 @@ msgs9, calls9, _, _ = run_main(
 pushed9 = [c["platform"] for c in calls9.get("pushes", [])]
 check("对不上的平台被拦下", has(msgs9, "github 账号对不上"), "")
 check("对的上的平台不受牵连（照样推 gitee）", pushed9 == ["gitee"], f"{pushed9}")
+
+# ── 10c ⭐ 「读不到账号」可能是网络抖动，不是令牌坏 —— 不许把整个平台砍掉 ──
+#   踩过（2026-10-13，推 git-sync 自己时）：`--platform both` 跑完，Gitee 顺利、
+#   **GitHub 被整个跳过**，报的原因是
+#   `github 令牌校验失败：URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] …>`。
+#   那是 **TLS 读中断**（纯网络抖动），旧代码却当令牌问题 `continue` ——
+#   于是**建库、推送一步都没试**，而 push_platform 里那 5 级降级阶梯
+#   （直连 / HTTP1.1 / 清代理 / 绑 IP）恰恰是治这个的，永远跑不到。
+#   实测：紧接着单跑 `--platform github`，**一次就过**。
+#   更早一层：`is_network_error()` 也认不出这句话（NET_ERROR_HINTS 里一条都不命中）。
+ssl_eof = ("URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] "
+           "EOF occurred in violation of protocol (_ssl.c:1000)>")
+
+msgs_n, calls_n, _, _ = run_main(
+    ["--platform", "both",
+     "--account", "https://gitee.com/zhangsan/",
+     "--account", "https://github.com/lisi/",
+     "--name", "flake"],
+    login={"gitee": "zhangsan"}, login_fail={"github": ssl_eof},
+    extra_cfg=dual_tok)
+created_n = [c["platform"] for c in calls_n.get("creates", [])]
+pushed_n = [c["platform"] for c in calls_n.get("pushes", [])]
+check("SSL EOF 被认成网络类错误", G.is_network_error(ssl_eof) is True, "")
+check("网络抖动不再被说成「令牌校验失败」", not has(msgs_n, "令牌校验失败"),
+      f"{[m for m in msgs_n if '令牌' in m]}")
+check("明说是网络类错误", has(msgs_n, "网络类"), "")
+check("平台没被砍掉：照样建库", created_n == ["gitee", "github"], f"{created_n}")
+check("平台没被砍掉：照样推送", pushed_n == ["gitee", "github"], f"{pushed_n}")
+check("退到你给的账号继续推",
+      [c["login"] for c in calls_n.get("pushes", [])][-1:] == ["lisi"],
+      f"{[c['login'] for c in calls_n.get('pushes', [])]}")
+check("说清「账号归属核对这一项跳过了」", has(msgs_n, "跳过了"), "")
+
+# 认证类失败：仍然必须停下 —— 那是"别把库建到别人账号下"的保护，不能一起放宽
+msgs_a, calls_a, _, _ = run_main(
+    ["--platform", "both",
+     "--account", "https://gitee.com/zhangsan/",
+     "--account", "https://github.com/lisi/",
+     "--name", "bad"],
+    login={"gitee": "zhangsan"}, login_fail={"github": "401 Bad credentials"},
+    extra_cfg=dual_tok)
+pushed_a = [c["platform"] for c in calls_a.get("pushes", [])]
+check("认证类失败仍然报「令牌校验失败」", has(msgs_a, "令牌校验失败"), "")
+check("认证类失败仍然拦下那个平台", pushed_a == ["gitee"], f"{pushed_a}")
+
+# 网络抖动 + 没有可退的账号（没给 --account、配置里也没记录）-> 跳过，
+# 但必须说清是"连不上"而不是"令牌不对"，并给出补推命令
+msgs_f, calls_f, _, _ = run_main(
+    ["--platform", "gitee", "--name", "nofb"],
+    login={}, login_fail={"gitee": ssl_eof}, extra_cfg=dual_tok)
+check("认不出账号且没给 --account 时跳过",
+      "create" not in calls_f, f"{calls_f.get('create')}")
+check("跳过原因是「连不上」而不是「令牌」", has(msgs_f, "连不上"), "")
+check("给了只补这个平台的命令",
+      has(msgs_f, f"--account https://{G.HOSTS['gitee']}/<账号>/"), "")
 
 # ── 10x ⭐ 新建仓库的可见性第一次没纠正成功 -> 推送之后必须补一刀 ──
 #   踩过（2026-10-03，推 douyin-publish 时）：Gitee 新建的仓库**此刻是空的**，
