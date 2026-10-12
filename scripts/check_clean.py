@@ -138,18 +138,47 @@ def distributable_files(root: pathlib.Path):
     return [root / n for n in p.stdout.decode("utf-8", "replace").split("\0") if n]
 
 
-def scan_junk(root: pathlib.Path):
-    """返回 [(类别, 相对路径)]"""
+def scan_junk(root: pathlib.Path, distributable=None):
+    """返回 [(类别, 相对路径, 是否会被分发出去)]。
+
+    ★ 为什么要判"会不会被分发"（2026-10-13）：原来只有一句
+      「运行/编译会产生，**分发前清掉**」，**没说是哪个渠道**。于是这两种东西
+      在报告里长得一模一样：
+
+        a. `tools/rx_local/__pycache__`（已被 .gitignore 挡住，**根本不会进 git**）
+        b. 仓库里躺着、没被挡住的 `__pycache__`（**真的会跟着上去**，严重得多）
+
+      实测在 drug-keeper 上报出来的就是 (a)，却和 (b) 一样印着"分发前清掉" ——
+      用户要么白清一遍，要么（更坏）见惯了这种提示，等到真出现 (b) 时也当噪声略过。
+      判据还是同一个：**拿"真实分发范围"去判**，别让报表自己含糊。
+    """
+    ships_set = set()
+    if distributable is not None:
+        try:
+            ships_set = {p.resolve() for p in distributable}
+        except OSError:
+            ships_set = set()
+
     found = []
     for p in root.rglob("*"):
         parts = {s.lower() for s in p.parts}
+        is_junk = False
         if parts & JUNK_DIRS:
             if p.is_dir() and p.name.lower() in JUNK_DIRS:
-                found.append(("不该分发的目录", p.relative_to(root)))
+                is_junk = True
             elif p.is_file() and p.suffix.lower() in JUNK_EXT:
-                found.append(("不该分发的文件", p.relative_to(root)))
+                is_junk = True
         elif p.is_file() and p.suffix.lower() in JUNK_EXT:
-            found.append(("不该分发的文件", p.relative_to(root)))
+            is_junk = True
+        if not is_junk:
+            continue
+        if p.is_dir():
+            rp = p.resolve()
+            ships = any(rp == w or rp in w.parents for w in ships_set)
+        else:
+            ships = p.resolve() in ships_set
+        kind = "不该分发的目录" if p.is_dir() else "不该分发的文件"
+        found.append((kind, p.relative_to(root), ships))
     return sorted(set(found), key=lambda x: str(x[1]))
 
 
@@ -204,7 +233,8 @@ def main(argv=None):
         print(f"规则 {len(RULES)} 条 + 结构检查，自定义拉黑词 {shown}{src}\n")
 
     files = distributable_files(root)
-    if files is None:
+    dist_scope = files is not None            # ← 分清"问到了 git"和"退回走全目录"
+    if not dist_scope:
         scope = "目录下所有文件（此目录不是 git 仓库，或没装 git）"
         files = [p for p in sorted(root.rglob("*")) if p.is_file()]
     else:
@@ -222,7 +252,7 @@ def main(argv=None):
         for h in scan_text(p, deny):
             file_hits.append((p.relative_to(root),) + h)
 
-    junk = scan_junk(root)
+    junk = scan_junk(root, files if dist_scope else None)
 
     if file_hits and not args.quiet:
         print("=" * 68)
@@ -231,21 +261,46 @@ def main(argv=None):
         for rel, rule, lineno, frag, line in file_hits:
             print(f"  {rel}:{lineno}  [{rule}]")
             print(f"      {frag[:80]}")
-    if junk and not args.quiet:
-        print()
-        print("=" * 68)
-        print(f"结构问题 {len(junk)} 处（运行/编译会产生，分发前清掉）")
-        print("=" * 68)
-        for kind, rel in junk:
-            print(f"  [{kind}] {rel}")
+    # ---- 结构问题：分成「会跟着分发出去的」和「只在本机的」----
+    #   ★ 只有前者算"发现"。后者（被 .gitignore 挡住的 __pycache__ 之类）**永远清不完**
+    #     —— 跑一次测试就长回来。把它算进"有发现"，每次跑都返回非 0，
+    #     人就学会无视这个脚本了；那才是真正的损失。但它也不该被藏起来（打包 zip 时确实会带上）。
+    ships = [j for j in junk if j[2]] if dist_scope else []
+    local_only = [j for j in junk if not j[2]] if dist_scope else []
 
-    total = len(file_hits) + len(junk)
+    if junk and not args.quiet:
+        if not dist_scope:
+            print()
+            print("=" * 68)
+            print(f"结构问题 {len(junk)} 处（运行/编译会产生）")
+            print("=" * 68)
+            for kind, rel, _ in junk:
+                print(f"  [{kind}] {rel}")
+            print("  这不是 git 仓库，判断不了「会不会被分发」——打包前一律清掉。")
+        if ships:
+            print()
+            print("=" * 68)
+            print(f"★ 会被分发出去 {len(ships)} 处 —— 这些必须清（不清就会跟着上传）")
+            print("=" * 68)
+            for kind, rel, _ in ships:
+                print(f"  [{kind}] {rel}")
+        if local_only:
+            print()
+            print(f"只在本机、不会进 git 的运行产物 {len(local_only)} 处"
+                  f"（被 .gitignore 挡住，不用为了推送去清）：")
+            for kind, rel, _ in local_only:
+                print(f"  [{kind}] {rel}")
+            print("  ⚠️ 但如果你是把整个目录打成 zip 分发，这些会被一起带上，那时要先清。")
+
+    total = len(file_hits) + len(ships)
     print()
     print("=" * 68)
     if total == 0:
         print(f"[干净] 扫了 {n_files} 个文本文件，未发现敏感夹带。可以分发。")
+        if local_only:
+            print(f"       （另有 {len(local_only)} 处只在本机的运行产物，不影响推送）")
         return 0
-    print(f"[有发现] {len(file_hits)} 处内容命中 + {len(junk)} 处结构问题。")
+    print(f"[有发现] {len(file_hits)} 处内容命中 + {len(ships)} 处会跟着分发的结构问题。")
     print("逐条看过再决定：有些命中是误报（示例文本、测试桩），")
     print("但**必须有人看过**——这正是这个脚本存在的意义。")
     return 1
