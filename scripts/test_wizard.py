@@ -338,12 +338,13 @@ print("=" * 66)
 
 
 def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None,
-             align_seq=None, login_fail=None):
+             align_seq=None, login_fail=None, create_fail=None):
     """带桩跑完整 main()：网络层、建库、推送全部替换，输出被收集。
 
     login 可以给 str，也可以给 {平台: 账号名} —— 两个平台账号名不同时要用后者。
     login_fail 给 {平台: 错误文本}，用来模拟"这个平台读不到账号"；
     不给就退回默认的 401（**认证类**）。想模拟网络类抖动就传一段带 TLS 指纹的文本。
+    create_fail 同理，作用在建库那一步（用来验"网络抖动不许被说成建库失败"）。
     align_seq 给一串 (是否已确认, 提示语列表)，按调用次序返回；不给就永远成功。
     """
     msgs, calls = [], {}
@@ -359,8 +360,11 @@ def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None,
 
     def fake_create(platform, token, name, private, desc):
         calls["create"] = dict(platform=platform, name=name, private=private)
+        calls["create_attempts"] = calls.get("create_attempts", 0) + 1
         calls.setdefault("creates", []).append(dict(platform=platform, name=name,
                                                     private=private))
+        if create_fail and platform in create_fail:
+            return False, False, create_fail[platform]
         return created
 
     def fake_resolve(root, live, proto, cfg, args):
@@ -408,7 +412,7 @@ def run_main(argv, login="zhangsan", created=(True, True, ""), extra_cfg=None,
     G.resolve_remotes = fake_resolve
     G.push_platform = fake_push
     G.INTERACTIVE = False
-    G.LOGIN_RETRY_SLEEP = 0        # 别让重试真的睡：用例跑得慢没人爱跑
+    G.NET_RETRY_SLEEP = 0          # 别让重试真的睡：用例跑得慢没人爱跑
 
     p = mkproj("MainProj")
     cp = TMP / f"maincfg_{len(msgs)}_{id(argv)}.json"
@@ -606,6 +610,42 @@ check("认不出账号且没给 --account 时跳过",
 check("跳过原因是「连不上」而不是「令牌」", has(msgs_f, "连不上"), "")
 check("给了只补这个平台的命令",
       has(msgs_f, f"--account https://{G.HOSTS['gitee']}/<账号>/"), "")
+
+# ── 10d ⭐ 同一个毛病的**下一个化身**：建库那一步（2026-10-13，v1.15.7）──
+#   修完 10c 才发现在建库这一步又原样演一遍：网络抖动被报成「建库失败」，
+#   读着像"平台拒绝了你"，而 create_error_hint() 里**没有网络类分支**（返回空列表），
+#   屏幕上只剩一句 `HTTP 0: URLError: …`（那个 HTTP 0 也是假的，根本不是响应）。
+msgs_cc, calls_cc, _, _ = run_main(
+    ["--platform", "gitee", "--name", "cf"],
+    login={"gitee": "zhangsan"}, create_fail={"gitee": ssl_eof}, extra_cfg=dual_tok)
+check("建库时网络抖动不再被说成「建库失败」", not has(msgs_cc, "建库失败"),
+      f"{[m for m in msgs_cc if '建库' in m]}")
+check("明说是「建库时连不上」", has(msgs_cc, "建库时连不上"), "")
+check("建库这一步也重试了（>1 次）", calls_cc.get("create_attempts", 0) > 1,
+      f"{calls_cc.get('create_attempts')}")
+check("跳过时给了只补这个平台的命令",
+      has(msgs_cc, f"--account https://{G.HOSTS['gitee']}/<账号>/"), "")
+check("建库没成就不推送", "push" not in calls_cc)
+
+# 对照：实名认证那种**真**失败，仍旧要说「建库失败」并给人话提示，而且**不重试**
+msgs_rr, calls_rr, _, _ = run_main(
+    ["--platform", "gitee", "--name", "rf"],
+    login={"gitee": "zhangsan"},
+    create_fail={"gitee": "HTTP 422: 当前账户尚未认证身份，"
+                          "请通过「个人设置 - 帐号信息」下完成身份认证后再操作"},
+    extra_cfg=dual_tok)
+check("真失败仍报「建库失败」", has(msgs_rr, "建库失败"), "")
+check("实名认证的提示没丢", has(msgs_rr, "实名认证"), "")
+check("真失败不重试（只 1 次，别拿重试耗时间）", calls_rr.get("create_attempts") == 1,
+      f"{calls_rr.get('create_attempts')}")
+
+# 措辞：没拿到 HTTP 响应时（status==0）不许编一个 "HTTP 0" 状态码
+check("api_err 对 status=0 不编状态码",
+      G.api_err(0, {}, "URLError: <urlopen error [SSL: …]>").startswith("URLError"),
+      G.api_err(0, {}, "URLError: boom"))
+check("api_err 对真 HTTP 状态照旧带前缀",
+      G.api_err(422, {"message": "x"}, "").startswith("HTTP 422"),
+      G.api_err(422, {"message": "x"}, ""))
 
 # ── 10x ⭐ 新建仓库的可见性第一次没纠正成功 -> 推送之后必须补一刀 ──
 #   踩过（2026-10-03，推 douyin-publish 时）：Gitee 新建的仓库**此刻是空的**，

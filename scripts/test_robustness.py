@@ -103,6 +103,55 @@ check("仍然不误判认证失败",
       not G.is_network_error("401 Bad credentials") and
       not G.is_network_error("Access token does not exist"))
 
+# ── retry_network：网络类才重试、非网络类立刻回（2026-10-13，v1.15.7）──
+#   抽这个共用函数是因为"网络抖动被当成结论"这个毛病**在两步上各演了一遍**
+#   （先「令牌校验失败」、再「建库失败」）。两条路径都得有重试，但**不能**给
+#   认证/权限类也重试 —— 那种重试一百次也一样，只是白等（§2.13）。
+_SSL_EOF = ("URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING] "
+            "EOF occurred in violation of protocol (_ssl.c:1000)>")
+_s1 = {"n": 0}
+
+
+def _flaky():
+    _s1["n"] += 1
+    return ("", _SSL_EOF) if _s1["n"] < 3 else ("zhangsan", "")
+
+
+check("retry_network：抖两下之后能成功",
+      G.retry_network(_flaky, lambda lg, e: bool(lg), sleep=0) == ("zhangsan", ""),
+      f"调用 {_s1['n']} 次")
+check("retry_network：为它共试了 3 次（1+2）", _s1["n"] == 3, f"{_s1['n']}")
+
+_s2 = {"n": 0}
+
+
+def _auth_fail():
+    _s2["n"] += 1
+    return "", "401 Bad credentials"
+
+
+check("retry_network：认证类失败**不重试**（立刻回）",
+      G.retry_network(_auth_fail, lambda lg, e: bool(lg), sleep=0)[0] == ""
+      and _s2["n"] == 1, f"调用 {_s2['n']} 次")
+
+_s3 = {"n": 0}
+
+
+def _always_flaky():
+    _s3["n"] += 1
+    return "", _SSL_EOF
+
+
+check("retry_network：一直抖就试满 1+2 次就收手",
+      G.retry_network(_always_flaky, lambda lg, e: bool(lg), sleep=0)[0] == ""
+      and _s3["n"] == 3, f"调用 {_s3['n']} 次")
+
+check("api_err：status=0 不编状态码（没响应就没有状态码）",
+      G.api_err(0, {}, _SSL_EOF).startswith("URLError"), G.api_err(0, {}, _SSL_EOF)[:40])
+check("api_err：真 HTTP 状态照旧带前缀",
+      G.api_err(422, {"message": "x"}, "").startswith("HTTP 422"),
+      G.api_err(422, {"message": "x"}, ""))
+
 check("git_prefix 基础", G.git_prefix("gitee.com") == ["git", "-c", "credential.helper="])
 check("git_prefix 绑 IP", G.git_prefix("github.com", "1.2.3.4")[-2:]
       == ["-c", "http.curloptResolve=github.com:443:1.2.3.4"])

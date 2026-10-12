@@ -314,6 +314,7 @@ python scripts/git_sync.py --intro
 | 体检报告说「已被 .gitignore 排除：**某个大目录**」，可那个目录里的文件**明明在"将推送 N 项"的清单里** | 早期版本的报表会**把 git 给的忽略路径截成顶层名**：只排除了 `tools/子目录/__pycache__/`，却被报成整个 `tools/`。同一屏两行自相矛盾 | 升级到 v1.15.2。自诊：`git status --porcelain --ignored -z \| tr '\0' '\n' \| grep '^!!'` 看真相。**别因为这个去改 `.gitignore`** |
 | 推送说成功、远端 SHA 也核对一致，可去读线上文件**发现是旧版本** | ⚠️ **`raw.githubusercontent.com` 有 CDN 缓存（约 5 分钟）** —— 你读到的是缓存，不是仓库。**走缓存的"读回"不算读回** | 改用 API 读内容并比 **blob sha**（`GET .../contents/<路径>`，两端 sha 相同才是真一致）。2026-10-13 实测：raw 读到 GitHub 是旧版、API 一读两端一致——推送没问题，**别去重推** |
 | 推两个平台，其中**一个被整段跳过**，报 `xxx 令牌校验失败：… [SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol` | ⚠️ **那是 TLS 读中断（网络抖动），被写成了"你令牌不对"**。老版本两处叠加：认不出这类 Python 侧的报错 + 认不出就跳过 → **建库、推送一步都没试**，后面那 5 级自救（清代理 / 换 IP / HTTP1.1）**永远跑不到** | 升级到 v1.15.6（网络类先重试，再按你 `--account` 给的账号继续；**只有认证类才停下**）。应急：**单跑那一个平台** `--platform github --yes`——实测一次就过。**别去换令牌** |
+| 报 `xxx 建库失败：HTTP 0: URLError: <urlopen error [SSL: …]>`（或别的 urlopen / connection 报错） | ⚠️ **还是网络抖动，不是"仓库名/权限/实名认证"的问题**。两个烟幕弹：`HTTP 0` 读着像"平台回了个怪状态码"，其实是**压根没连上**；`建库失败` 把你往"换个仓库名 / 查权限"的方向带。老版本建库这步**不重试**，也没有网络类分支 | 升级到 v1.15.7（建库也套上网络重试；网络类会说"**建库时连不上**"并给补推命令，只有真失败才说"建库失败"）。**别去改仓库名** |
 | 自己算的本地文件 sha 和远端**对不上**，看着像"没推上去" | ⚠️ 本机 `core.autocrlf=true`：工作区里是 CRLF、仓库里存的是 LF，你手工算的那版**必然**对不上（它和"推送失败"长得一模一样） | 用 `git hash-object <文件>` 算——它跟 `git add` 走同一套换行符过滤器。**顺手看一眼：两个平台是不是互相一致？一致就是你算错了，不是没推上去** |
 
 ---
@@ -337,13 +338,13 @@ rebase 由你决定）· **force push（一行都没有）** · 替你 stash 或
 ## 开发：跑测试
 
 ```bash
-python scripts/test_robustness.py     # 85 项：网络降级、IP 候选、refs 核对、远端复用、删除项、代理冒充认证失败、上游不被顶掉、校验错误不丢、被排除目录由 git 判定
-python scripts/test_wizard.py         # 103 项：四问向导、账号解析、按平台核对、可见性核对
-python scripts/test_repo_create.py    # 94 项：建库 API 契约、可见性纠正、改已存在仓库的可见性
+python scripts/test_robustness.py     # 99 项：网络降级、IP 候选、refs 核对、远端复用、删除项、代理冒充认证失败、上游不被顶掉、校验错误不丢、被排除目录由 git 判定、网络重试函数
+python scripts/test_wizard.py         # 130 项：四问向导、账号解析、按平台核对、可见性核对、网络抖动不砍平台、建库失败分流
+python scripts/test_repo_create.py    # 97 项：建库 API 契约、可见性纠正、改已存在仓库的可见性
 python scripts/test_sync_modes.py     # 60 项：八种同步关系、拉取/对齐的拒绝路径、只读性
 ```
 
-共 **342 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
+共 **386 项**，全部用桩化（不打真实网络、不碰真实仓库），可以随便跑。
 测试里插了一根钉子：`main()` 一旦试图访问真实网络就**直接抛异常**——
 避免"漏打一个桩"让测试悄悄降级成假绿。
 

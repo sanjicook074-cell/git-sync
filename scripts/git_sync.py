@@ -43,7 +43,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "1.15.6"
+VERSION = "1.15.7"
 
 CONFIG_PATH = Path.home() / ".workbuddy" / "git-sync.json"
 
@@ -149,8 +149,8 @@ PUSH_TOTAL_BUDGET = 420
 
 # 「读不到令牌所属账号」若是网络类错误，重试几次再退到用户给的账号。
 # 单列成常量是为了测试能把它调成 0 —— 否则每两条用例白等 1.6 秒。
-LOGIN_RETRY_TIMES = 2
-LOGIN_RETRY_SLEEP = 0.8
+NET_RETRY_TIMES = 2
+NET_RETRY_SLEEP = 0.8
 
 
 def net_env(strip_proxy=False):
@@ -198,6 +198,29 @@ def has_proxy_env():
     没配代理还报认证失败，那就是真的凭据问题，该停就停。
     """
     return any(os.environ.get(var) for var in PROXY_VARS)
+
+
+def retry_network(fn, ok, times=None, sleep=None):
+    """网络类失败就重试；返回 fn 最后一次的结果（各家都把错误文本放最后一项）。
+
+    ★ 为什么要这个东西（2026-10-13 实测两处都栽在它上面）：
+    本机链路会偶发 TLS 读中断 —— `SSL: UNEXPECTED_EOF_WHILE_READING` /
+    `ConnectionResetError`。这种抖动**重试一次往往就过**（当天实测：被整段跳过的那次，
+    单跑一遍一次成功），而"不重试 + 把网络错误当成结论"的代价是
+    **整个平台被跳过**，而且屏幕上那句失败原因指向完全无关的方向
+    （先被写成「令牌校验失败」，下一步又被写成「建库失败」）。
+    → 凡是调平台 API 的地方（读账号 / 建库）都套这一层。
+
+    ok(*result) 判成功；**非网络类失败立刻返回**，不拿重试耗时间
+    （认证/权限问题重试一百次也一样，而且 §2.13 就是"不盲目重试"）。
+    """
+    result = fn()
+    for _ in range(NET_RETRY_TIMES if times is None else times):
+        if ok(*result) or not is_network_error(result[-1]):
+            return result
+        time.sleep(NET_RETRY_SLEEP if sleep is None else sleep)
+        result = fn()
+    return result
 
 
 def git_prefix(host, ip=None, http1=False):
@@ -494,6 +517,19 @@ def flatten_error(payload, raw):
     return " / ".join(uniq) or "未知错误"
 
 
+def api_err(status, payload, raw):
+    """统一措辞：**没拿到 HTTP 响应时（status==0）不要给它编一个状态码**。
+
+    http_json 在异常兜底那条路上返回 status=0，于是老的 `f"HTTP {status}: …"`
+    会印出 `HTTP 0: URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]…>`
+    —— 读着像"平台回了个奇怪的状态码"，其实**压根没连上**（2026-10-13 实测现场）。
+    这和同一天那句「令牌校验失败」「建库失败」是同一类毛病：
+    **给不是结论的东西安一个像结论的说法，把人送去查错方向。**
+    """
+    msg = flatten_error(payload, raw)
+    return f"HTTP {status}: {msg}" if status else (msg or "未收到远端响应")
+
+
 def api_login(platform, token):
     if platform == "gitee":
         status, payload, raw = http_json(
@@ -532,7 +568,8 @@ def api_create_repo(platform, token, name, private, description):
         return True, True, ""
     if already:
         return True, False, ""
-    return False, False, f"HTTP {status}: {message}"
+    # api_err(): status==0（压根没连上）时不给它编一个 "HTTP 0" 状态码
+    return False, False, api_err(status, payload, raw)
 
 
 def repo_visibility(platform, owner, repo, token):
@@ -550,7 +587,7 @@ def repo_visibility(platform, owner, repo, token):
             f"https://api.github.com/repos/{owner}/{repo}", token=token)
     if status == 200 and isinstance(payload, dict) and "private" in payload:
         return bool(payload["private"]), ""
-    return None, f"HTTP {status}: {flatten_error(payload, raw)}"
+    return None, api_err(status, payload, raw)
 
 
 def api_set_visibility(platform, owner, repo, token, private):
@@ -583,7 +620,7 @@ def api_set_visibility(platform, owner, repo, token, private):
             token=token, body={"private": bool(private)})
     if status == 200:
         return True, ""
-    return False, f"HTTP {status}: {flatten_error(payload, raw)}"
+    return False, api_err(status, payload, raw)
 
 
 def align_visibility(platform, owner, repo, token, private, is_new):
@@ -2483,23 +2520,15 @@ def main():
         token = tokens.get(platform, "")
         if not token:
             continue
-        login, err = api_login(platform, token)
-        # ★ 「读不到账号」不等于「令牌有问题」（2026-10-13 实测踩到，v1.15.6）。
+        # ★ 「读不到账号」不等于「令牌有问题」（2026-10-13 实测，v1.15.6）。
         #   现场：`--platform both` 推 git-sync 自己，Gitee 顺利、**GitHub 被整个跳过**，
-        #   报的原因是 `github 令牌校验失败：URLError: <urlopen error [SSL:
-        #   UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol>`。
-        #   那是 **TLS 读中断**（纯网络抖动），旧代码却把它当令牌问题 → `continue`
-        #   → **建库、推送一步都没试**。而 `push_platform()` 里那 5 级降级阶梯
-        #   （直连 / HTTP1.1 / 清代理 / 绑 IP）**恰恰是治这种抖动的**，
-        #   却因为这一句 continue 永远跑不到。下一次单跑 `--platform github` 一次就过。
-        #   → 所以网络类失败：先重试，再退到「你显式给的账号」继续走；
-        #     只有**认证类**失败才真的停下（那才是"别把库建到别人账号下"的保护）。
-        if not login and is_network_error(err):
-            for _ in range(LOGIN_RETRY_TIMES):
-                time.sleep(LOGIN_RETRY_SLEEP)
-                login, err = api_login(platform, token)
-                if login or not is_network_error(err):
-                    break
+        #   理由是 `令牌校验失败：URLError: <urlopen error [SSL: UNEXPECTED_EOF_WHILE_READING]…>`
+        #   ——那是 **TLS 读中断**。旧代码把它当令牌问题 `continue` → **建库推送一步都没试**，
+        #   而 push_platform() 那 5 级降级阶梯（直连/HTTP1.1/清代理/绑 IP）**正是治这个的**。
+        #   单跑 `--platform github` 一次就过 → 所以：网络类先重试，再退到「你显式给的账号」
+        #   继续走；**只有认证类才真的停下**（那才是"别把库建到别人账号下"的保护）。
+        login, err = retry_network(lambda: api_login(platform, token),
+                                   lambda lg, e: bool(lg))
         if not login:
             fallback = (expect_logins.get(platform)
                         or (cfg.get("logins") or {}).get(platform) or "")
@@ -2528,12 +2557,24 @@ def main():
         logins[platform] = login
         cfg["logins"][platform] = login
         save_config(cfg)
-        created, is_new, err = api_create_repo(platform, token, repo_name,
-                                               private, args.desc)
+        created, is_new, err = retry_network(
+            lambda: api_create_repo(platform, token, repo_name, private, args.desc),
+            lambda c, n, e: bool(c))
         if not created:
-            bad(f"{platform} 建库失败：{err}")
-            for line in create_error_hint(err):
-                info(line)
+            # ★ 同一个毛病的**下一个化身**（2026-10-13，v1.15.7）：上面那步修完才发现在这一步
+            #   又原样演一遍 —— 网络抖动会被报成「建库失败」，读起来像"平台拒绝了你"，
+            #   而 `create_error_hint()` 里**没有任何网络类分支**（返回空列表），
+            #   于是屏幕上只剩一句 `HTTP 0: URLError: …`（那个 HTTP 0 也是假的，
+            #   根本不是 HTTP 响应），外加**整个平台被跳过**。
+            if is_network_error(err):
+                bad(f"{platform} 建库时连不上（网络类错误，不是仓库名/权限问题）：{err}")
+                info("       已重试仍失败，本轮跳过该平台。稍后只补它：")
+                info(f"       --platform {platform} "
+                     f"--account https://{HOSTS[platform]}/<账号>/ --yes")
+            else:
+                bad(f"{platform} 建库失败：{err}")
+                for line in create_error_hint(err):
+                    info(line)
             continue
         ok(f"{platform} → {web_url(platform, login, repo_name)}"
            f"{'（新建）' if is_new else '（已存在，复用）'}")

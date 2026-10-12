@@ -1714,7 +1714,7 @@ CDN、代理、缓存、内容协商，每一个都能让"读回"变成"读了�
 ---
 
 
-### 7.18 第十四次：一个 TLS 抖动被写成了「你的令牌不对」（2026-10-13，v1.15.6）
+### 7.18 第十四次：一个 TLS 抖动被写成了「你的令牌不对」（2026-10-13，v1.15.6 → v1.15.7）
 
 **背景**：用户说「同步」→ 先把 `drug-keeper` 推了两平台（一次过）→ 顺手把本技能那一行文档
 修正也推上去 → **GitHub 被整个跳过了**。
@@ -1746,7 +1746,7 @@ CDN、代理、缓存、内容协商，每一个都能让"读回"变成"读了�
 - `NET_ERROR_HINTS` 补上 TLS 类指纹：`ssl` / `eof occurred` / `unexpected_eof` /
   `urlopen error` / `connection aborted` / `connection reset by peer` /
   `remote end closed` / `incompleteread`；
-- 校验那一步**分两类**：**网络类**先重试 2 次（`LOGIN_RETRY_TIMES/SLEEP`，测试里置 0），
+- 校验那一步**分两类**：**网络类**先重试 2 次（`NET_RETRY_TIMES/SLEEP`，测试里置 0），
   仍不行就**退到 `--account` 给的账号（其次配置里记过的）继续**，并明说
   "账号归属核对这一项跳过了"；**认证类才停下** —— 那是"别把库建到别人账号下"的保护，
   不能跟着一起放宽。没有任何可退账号时，报的是「**连不上**（网络类错误，不是令牌问题）」
@@ -1785,6 +1785,70 @@ SKILL.md  我算出来的 =     2d82537e0d   ← 只有我不同
 **两个平台互相一致、只有本地对不上时，先怀疑自己的算法。**
 
 版本 v1.15.5 → **v1.15.6**；四套测试 **353 → 370 条全过**。
+
+**⭐ 同一轮里第三个发现：建库那一步，是同一个毛病的下一个化身。**
+
+修完账号校验那一步、跑完冒烟之后，我又把这条代码路径往下翻了一层 —— 发现
+**建库步骤原样再演一遍**，而且症状只会更骗人：
+
+```python
+# v1.15.6 的建库步骤（修前）
+created, is_new, err = api_create_repo(platform, token, repo_name, private, args.desc)
+if not created:
+    bad(f"{platform} 建库失败：{err}")          # ← 网络抖也会被说成"建库失败"
+    for line in create_error_hint(err):
+        info(line)
+    continue
+```
+
+三处叠加：
+
+1. **不重试** —— 账号校验那一步已经会重试了，建库这一步还是裸调；
+2. `create_error_hint()` **没有任何网络类分支**（返回空列表）—— 于是既不补推、也不解释，
+   只留一句"建库失败"，**指向"仓库名 / 权限 / 实名认证"那些错误方向**；
+3. 同一类 TLS 抖动，在这里会印成
+   `github 建库失败：HTTP 0: URLError: <urlopen error [SSL: …]>` ——
+   那个 **`HTTP 0`** 尤其坏：读着像"平台回了个奇怪的状态码"，其实**压根没连上**。
+
+**修法（v1.15.7）**：
+
+- 把重试逻辑抽成一个共用函数 `retry_network(fn, ok)` —— 凡是要调平台 API 的地方
+  （读账号 / 建库）都套这一层，**网络类才重试、非网络类立刻返回**（别拿重试耗时间）：
+  ```python
+  def retry_network(fn, ok, times=None, sleep=None):
+      result = fn()
+      for _ in range(NET_RETRY_TIMES if times is None else times):
+          if ok(*result) or not is_network_error(result[-1]):
+              return result
+          time.sleep(NET_RETRY_SLEEP if sleep is None else sleep)
+          result = fn()
+      return result
+  ```
+- 建库失败**分两类**：网络类 → `bad("… 建库时连不上（网络类错误，不是仓库名/权限问题）")`
+  + 明说"已重试仍失败，本轮跳过该平台"+ 给只补该平台的命令；**非网络类 → 仍报"建库失败"**
+  + 保留原来那套人话提示（如实名认证）+ **不重试**（那是真的失败，重试一百次也一样）；
+- 新增 `api_err(status, payload, raw)` 统一措辞，**消掉假的 `HTTP 0`**：
+  ```python
+  def api_err(status, payload, raw):
+      msg = flatten_error(payload, raw)
+      return f"HTTP {status}: {msg}" if status else (msg or "未收到远端响应")
+  ```
+  `status==0` 只可能是"没拿到 HTTP 响应"（URL 打不通），**别给它编一个状态码**。
+  `api_login` / `repo_visibility` / `api_set_visibility` / `api_create_repo` 四处全改用它。
+
+**回归再 +16 条**（370 → 386）：`test_wizard.py` 120→130（新增 10d 段：建库网络抖动
+不许说"建库失败"、要明说"建库时连不上"、要重试 >1 次、要给补推命令、不推送；真失败
+对照 —— 实名认证仍报"建库失败"+ 保留提示 + **只 1 次不重试**；`api_err` 两连）；
+`test_robustness.py` 93→99（`retry_network` 五连：抖两下后成功共试 3 次 / 认证类只试 1 次 /
+一直抖试满 1+2 次收手；`api_err` 两连）。
+
+> 这是同一母题的**第五个化身**，而且和第四个（账号校验）**在同一个文件里、相隔几十行**。
+> 教训很硬：**修一个"把网络问题说成别的问题"的 bug 时，要把同一类调用点全部扫一遍** ——
+> 你以为修的是"账号校验"，其实那是一族毛病，**凡是"调平台 → 失败 → 报原因"的地方都有嫌疑**。
+> 判据也统一了：**网络类失败要重试并退到兜底继续；认证类失败立刻停**（那是保护）；
+> **非网络类失败不要重试**。
+
+版本 **v1.15.6 → v1.15.7**；四套测试 **370 → 386 条全过**（99 / 130 / 97 / 60）。
 
 ---
 
