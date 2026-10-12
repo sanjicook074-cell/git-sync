@@ -798,7 +798,7 @@ GitHub `helloai`）不能一次跑完——必须分两次、各带各的 `--nam
 | 默认分支显示成 master | 空仓库的平台默认分支 | 到仓库设置里把默认分支改成 main |
 | `.git` 目录残缺（只剩 `info/` 和 `objects/`） | 跑了 `git gc` / `git filter-repo`，safe-delete 拦截内部删除导致状态机错乱 | 动手前先 `cp -r .git` 备份；改用 `git filter-branch`；**永远别在本环境跑 git gc** |
 | 用平台 contents API 复核「某个文件到底传上去没有」，Gitee 那侧报出"文件竟然上去了" | **Gitee 的 contents API 对不存在的路径返回 `HTTP 200` + 空数组，不是 404**（GitHub 才是 404） | 判据要写成「空数组 = 不存在」，**别用 try/except 捕异常**。2026-10-04 实测：复核 `settings.json` 有没有泄漏时被这条反咬过——脚本喊"泄漏了"，再探一次才发现是空数组 |
-| **推送说成功、`ls-remote` 也核对一致，可去读线上文件发现是旧版本** | ⚠️ **`raw.githubusercontent.com` 有 CDN 缓存**（约 5 分钟）。你读到的不是仓库，是缓存 —— **走缓存的"读回"不算读回** | 改用 API 读文件内容并比 **blob sha**：`GET /repos/{owner}/{repo}/contents/{path}`（GitHub）或 `/api/v5/repos/{owner}/{repo}/contents/{path}`（Gitee），base64 解码后看内容；**两端 blob sha 相同才是真一致**。2026-10-13 实测：raw 读到 GitHub 是 `1.15.3`（旧的），API 一读两端都是 `1.15.4` 且 sha 相同——推送从头到尾没问题 |
+| **推送说成功、`ls-remote` 也核对一致，可去读线上文件发现是旧版本** | ⚠️ **`raw.githubusercontent.com` 有 CDN 缓存**（约 5 分钟）。你读到的不是仓库，是缓存 —— **走缓存的"读回"不算读回** | 改用 API 读文件内容并比 **blob sha**：`GET /repos/{owner}/{repo}/contents/{path}`（GitHub）或 `/api/v5/repos/{owner}/{repo}/contents/{path}`（Gitee）。**两家的 `sha` 字段都直接是 git blob sha**（2026-10-13 实测：Gitee 回 `8593823d5c…`，与本地 `sha1("blob <len>\0"+内容)` 逐位相同），所以拿它和 **`git hash-object <file>`** 比即可，**不用自己反算**。两端 sha 相同才是真一致 |
 
 ## 6. 接缝（以及为什么不需要另外装技能）
 
