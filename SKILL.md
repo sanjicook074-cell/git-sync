@@ -518,19 +518,20 @@ python git_sync.py --pull --align        # 拉完顺手对齐
     + 漏报（真被排除的 `.workbuddy/` 一个字都不提）。
     误报更坏：用户会以为源码目录没上去。
 
-    现在 `ignored_top_dirs(root)` 直接读 git 判定：
+    现在 `ignored_dirs(root)` 直接读 git 判定：
 
     ```python
     out = git_out(["status", "--porcelain", "--ignored", "-z"], root)
     # traditional 模式 → 目录级输出：!! .workbuddy/   !! dist/   !! _check/_tmp_time.js
-    # 只取带尾斜杠（目录）的条目的顶层名
+    # 只取带尾斜杠（目录）的条目，**并原样报出那条路径**（不截成顶层名，见 §7.16）
     ```
 
     ⚠️ 必须用 `--ignored` 的 **traditional**（默认）模式：它按目录聚合，
     输出 `!! dist/`；`--ignored=matching` 会把目录下每个文件都列一遍。
     并且**只认带尾斜杠的条目**——忽略的文件（`!! _check/_tmp_time.js`）
     不能把它的父目录 `_check/` 误加进名单。
-    回归断言在 `test_robustness.py` §13（6 条，含"改完 .gitignore 名单要跟着变"）。
+    回归断言在 `test_robustness.py` §13（9 条，含"改完 .gitignore 名单要跟着变"
+    和"嵌套被排除时不许报祖先名"）。
 
 ---
 
@@ -789,12 +790,14 @@ GitHub `helloai`）不能一次跑完——必须分两次、各带各的 `--nam
 | **从别的平台 clone 下来镜像过去，仓库的上游被悄悄改了** | v1.12.0 及以前 https 推送成功后**无条件**写 `branch.<分支>.remote`，把原有的 `origin`（如 Gitee）顶成了新推的远端（如 `mirror`）。之后裸跑 `git pull` 会去另一个平台拉 | 升级到 v1.13.0（已有上游不动，并打印"保持不动"）。手动还原：`git config branch.<分支>.remote origin && git config branch.<分支>.merge refs/heads/<分支>` |
 | **镜像已有仓库时，`--dry-run` 报「暂存区是空的，没有任何文件会被推送」** | 不是错误：clone 下来的仓库工作区本来就干净，暂存区 0 文件，而**密钥体检是针对暂存区做的**——所以它这次**什么都没扫** | 另外独立扫一遍内容：`python scripts/check_clean.py --dir <目录>`。**别把"空转的体检"当成"体检通过"** |
 | 体检说「将推送 1 项改动，合计 0 B」 | 这一项是**删除**，体积本来就是 0 | v1.6.0 起会单独写明「其中 N 项是删除（…）」；老版本看 `git diff --cached --name-status` 即可 |
-| 体检报告说某目录「已被 .gitignore 排除（体积不计入）」，可它**明明在推送的清单里** | ⚠️ **报表在猜**：v1.13.0 及以前拿一张写死的目录名表（含 `build`、`dist`）去比对"目录存不存在"，**没读 `.gitignore`** → 名字撞上就误报，名字不撞就漏报（实测 `build/` 因此被说成"已排除"，而它 88 个文件 712 KB 都在推） | 升级到 v1.14.0（`ignored_top_dirs()` 直接读 `git status --ignored`）。自诊：`git status --porcelain --ignored` 看真相。**别因为这句去改 .gitignore——先确认它是不是在说反话** |
+| 体检报告说某目录「已被 .gitignore 排除（体积不计入）」，可它**明明在推送的清单里** | ⚠️ **报表在猜**：v1.13.0 及以前拿一张写死的目录名表（含 `build`、`dist`）去比对"目录存不存在"，**没读 `.gitignore`** → 名字撞上就误报，名字不撞就漏报（实测 `build/` 因此被说成"已排除"，而它 88 个文件 712 KB 都在推） | 升级到 v1.14.0（`ignored_dirs()` 直接读 `git status --ignored`）。自诊：`git status --porcelain --ignored` 看真相。**别因为这句去改 .gitignore——先确认它是不是在说反话** |
+| 体检报告说「已被排除：**tools/**」，可 `tools/` 下的文件**就在推送清单里** | v1.14.0 / v1.15.x 在 v1.14.0 那次修复里**把答案截短了**：只取忽略路径的**顶层名**（`split("/")[0]`）。于是 `tools/rx_local/__pycache__/` 被报成 `tools/`（实测 drug-keeper，同一屏另一行还写着"将推送 15 项"） | 升级到 **v1.15.2**（`ignored_dirs()` 原样报 git 给的那条路径）。自诊：`git status --porcelain --ignored -z \| tr '\0' '\n' \| grep '^!!'` 看真相。见 §7.16 |
 | 提交时弹 .NET Framework 4.7.2 安装引导 | GCM 依赖 .NET 4.7.2+ | 改用 git 自带的 `wincred`：`git config --local credential.helper wincred` |
 | `~/.git-credentials` 里出现明文令牌 | 全局 `credential.helper=store` | 只在本仓库设 helper，别用 global store |
 | PyCharm 点 push 被弹窗拦住 | 凭据助手是需要 GUI 交互的那种（本机原为 `helper-selector`） | **本机已于 2026-09-22 根治**：global 加「空值 + `wincred`」覆盖，见 §2 第 16 条。其他机器按同样办法处理 |
 | 默认分支显示成 master | 空仓库的平台默认分支 | 到仓库设置里把默认分支改成 main |
 | `.git` 目录残缺（只剩 `info/` 和 `objects/`） | 跑了 `git gc` / `git filter-repo`，safe-delete 拦截内部删除导致状态机错乱 | 动手前先 `cp -r .git` 备份；改用 `git filter-branch`；**永远别在本环境跑 git gc** |
+| 用平台 contents API 复核「某个文件到底传上去没有」，Gitee 那侧报出"文件竟然上去了" | **Gitee 的 contents API 对不存在的路径返回 `HTTP 200` + 空数组，不是 404**（GitHub 才是 404） | 判据要写成「空数组 = 不存在」，**别用 try/except 捕异常**。2026-10-04 实测：复核 `settings.json` 有没有泄漏时被这条反咬过——脚本喊"泄漏了"，再探一次才发现是空数组 |
 
 ## 6. 接缝（以及为什么不需要另外装技能）
 
@@ -1395,11 +1398,14 @@ for probe in IGNORED_DIR_PROBES:
 而且这次是"报表说了反话"——用户会以为 `build/` 没上去（它是源码啊），
 或者以为看到的 1.9 MB 计算有误。**误报比漏报更坏**，因为前者会让人做出错误判断。
 
-→ 修复：新增 `ignored_top_dirs(root)`，直接读 git 的判定
+→ 修复：新增 `ignored_dirs(root)`，直接读 git 的判定
 （`git status --porcelain --ignored -z`，traditional 模式给目录级输出，
-只取**带尾斜杠**条目的顶层名）。候选表 `IGNORED_DIR_PROBES` 整个删掉——
+只取带尾斜杠条目的路径）。候选表 `IGNORED_DIR_PROBES` 整个删掉——
 **名单由规则决定，不预设。** 修完复跑同一个项目，报表变成
 `可能是 .gitignore 排除了：.workbuddy/, dist/`——两个都对。
+
+⚠️ 这一版的函数名是 `ignored_top_dirs`，且**取的是路径的顶层名**——**下一版**（§7.16）
+把这两点都改了（改名 `ignored_dirs`、原样报出路径）。
 
 **回归断言 6 条**（`test_robustness.py` §13，79 → 85）：
 真排除的必须出现、**没排除的 `build/` 不许出现**、`src/` 不出现、结果可重复、
@@ -1518,6 +1524,71 @@ for probe in IGNORED_DIR_PROBES:
 `test_wizard.py` 加 §10x / §10y（4 条，推送后补一刀的**调用顺序** `["align","push","align"]`、
 补的那刀仍走 `is_new=True`、两次都失败时汇总必须写「未核对上」并给出 `--visibility` 补救命令）。
 四套测试 342 → **350 条全过**。版本 v1.15.0 → **v1.15.1**。
+
+---
+
+### 7.16 第十二次：同一个毛病的**下一层**——报表把答案截短了（2026-10-13，v1.15.2）
+
+**背景**：用户说「同步」，同步的项目是 `drug-keeper`（药品管家，单文件 HTML）。
+`--dry-run` 一跑，报表里跳出一行：
+
+```
+将推送 15 项改动，合计 1.4 MB
+已被 .gitignore 排除（体积不计入）：tools/
+```
+
+**这行是错的。** `tools/rx_local/rx_local.py` 就在那 15 项里（它是这次要推的主角之一），
+上一行刚说"将推送 15 项"，下一行就说整个 `tools/` 被排除了——**同一屏两行自相矛盾**。
+去问 git：
+
+```
+$ git status --porcelain --ignored -z | tr '\0' '\n' | grep '^!!'
+!! _check/_tmp_deny_names.txt
+!! tools/rx_local/__pycache__/
+```
+
+git 说得明明白白：被排除的只有那个 `__pycache__` 目录（和一个本机专用的药名名单文件）。
+**问题出在我们读 git 之后又动了手**——§7.13 那次加的实现是这样的：
+
+```python
+top = item[3:].strip().rstrip("/").split("/")[0]   # ← 只取顶层名
+names.add(top + "/")
+```
+
+`tools/rx_local/__pycache__/` 的顶层名是 `tools`，于是**整个 `tools/` 被宣布排除**。
+和 §7.13 那次（拿写死的目录名表去猜）**是同一个毛病的下一层**：上次是**没问 git**，
+这次是**问了 git，却把答案截短了**。两次的结果一样——报表和实际做的事相反。
+
+**这个误报为什么比一般的难发现**：它不报错、不崩溃，只在报表里多一句读起来很合理的话。
+`tools/` 这种名字被说成"已排除"，作者（我）扫一眼会觉得"哦对，忽略目录嘛"，**看不出问题**。
+只有把**暂存清单**和**这一行**并排放在一起看，矛盾才浮出来。
+→ 和 §7.13 的教训完全一致：**误报比漏报更坏**，因为前者会让人做出错误判断。
+
+**修复**：`ignored_top_dirs` → 改名 `ignored_dirs`（名字里那个 "top" 本身就是误导），
+并且**原样报出 git 给的那条路径**：
+
+```python
+path = item[3:].strip().rstrip("/")
+if path:
+    names.add(path + "/")
+```
+
+修完复跑同一个项目，报表变成
+`已被 .gitignore 排除（体积不计入）：tools/rx_local/__pycache__/`——和暂存清单不再打架。
+
+**回归断言 +3 条**（`test_robustness.py` §13b，85 → 88）：新建一个仓库，只排除
+`tools/rx_local/__pycache__/`（父目录里有个**要推送**的 `rx_local.py`），断言
+① 报的是嵌套路径本身 ② **父目录 `tools/` 不许出现**（这条是这次的核心回归）
+③ 无关的 `top/` 也不出现。
+四套测试 350 → **353 条全过**。版本 v1.15.1 → **v1.15.2**。
+
+**这一轮最值得记的**：**"问对了数据源"不等于"报对了"。**
+§7.13 修的是数据源（别猜、去问 git），这一轮修的是**报之前别做手脚**。
+两步看起来都是"读一个列表然后打印"，但中间那行 `split("/")[0]` 就足以把结论
+从"这个缓存目录没上去"变成"你一整个源码目录没上去"。
+→ 通用检查法：**凡是报表里的数字/名单，都拿一个独立来源对一遍**
+（这次是 `git diff --cached --name-only` 对 `ignored_dirs()`），
+两个来源在同一屏里说得不一样，就一定有一边错了——而且多半是报表。
 
 ---
 

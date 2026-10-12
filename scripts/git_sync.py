@@ -43,7 +43,7 @@ from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
 
-VERSION = "1.15.1"
+VERSION = "1.15.2"
 
 CONFIG_PATH = Path.home() / ".workbuddy" / "git-sync.json"
 
@@ -1091,10 +1091,10 @@ def stage_all(root):
 # --------------------------------------------------------------------------
 # 体检（对暂存区）
 # --------------------------------------------------------------------------
-def ignored_top_dirs(root):
-    """哪些顶层目录**真的**被 .gitignore 排除了 —— 问 git，别猜目录名。
+def ignored_dirs(root):
+    """哪些目录**真的**被 .gitignore 排除了 —— 问 git，别猜目录名。
 
-    2026-09-27 修。原实现只做了一件事：拿 IGNORED_DIR_PROBES 里的名字去
+    2026-09-27 修（第一次）。原实现只做了一件事：拿 IGNORED_DIR_PROBES 里的名字去
     `(root / probe).is_dir()`，存在就宣布「已被 .gitignore 排除（体积不计入）」。
     那既不是判据，而且两个方向都会错 —— 实测在九键拼音项目上同时踩中：
 
@@ -1112,16 +1112,26 @@ def ignored_top_dirs(root):
         !! .workbuddy/
         !! _check/_tmp_time.js
         !! dist/
-    只取**带尾斜杠**的条目（即目录）的顶层名。名单完全由规则决定，不预设候选表。
+
+    ⚠️ 2026-10-13 修（第二次，同一个毛病的下一层）。第一版虽然改成问 git 了，
+    但**把答案截短了**：只取路径的**顶层名**（`split("/")[0]`）。于是当一个
+    **嵌套**目录被排除时，报的是它祖先的名字 —— 实测 drug-keeper 项目上：
+    `.gitignore` 排的是 `tools/rx_local/__pycache__/`（只有一个缓存目录），
+    报表却说「已被 .gitignore 排除：**tools/**」；而同一屏上一行刚写着
+    「将推送 15 项改动」，里面就有 `tools/rx_local/rx_local.py`。
+    **又是两行自相矛盾**，而且这次很容易让人以为整个 `tools/` 没上去。
+
+    → 现在返回 **git 报出来的那条路径本身**（去尾斜杠、统一补一个尾斜杠），
+    不做任何截短。名单完全由规则决定，不预设候选表。
     """
     out = git_out(["status", "--porcelain", "--ignored", "-z"], root)
     names = set()
     for item in out.split("\0"):
         if not item.startswith("!! ") or not item.endswith("/"):
             continue
-        top = item[3:].strip().rstrip("/").split("/")[0]
-        if top:
-            names.add(top + "/")
+        path = item[3:].strip().rstrip("/")
+        if path:
+            names.add(path + "/")
     return sorted(names)
 
 
@@ -1172,7 +1182,7 @@ def scan_staged(root, files):
             report["secrets_content"].append(hit)
 
     report["big"].sort(key=lambda d: -d["size"])
-    report["ignored_dirs"] = ignored_top_dirs(root)
+    report["ignored_dirs"] = ignored_dirs(root)
     return report
 
 

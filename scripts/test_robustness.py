@@ -568,7 +568,7 @@ check("救回来时报告了通道名", bool(_vb), f"via={_vb!r}")
 
 print()
 print("=" * 60)
-print("13) ignored_top_dirs：排除名单必须问 git，不能猜目录名")
+print("13) ignored_dirs：排除名单必须问 git，不能猜目录名，也不能把答案截短")
 print("=" * 60)
 
 # 2026-09-27 回归。原实现只看「目录名在 IGNORED_DIR_PROBES 里 且 目录存在」，
@@ -591,17 +591,45 @@ for _c in (["git", "init", "-b", "main", "-q"],
            ["git", "commit", "-q", "-m", "first"]):
     sh(_c, cwd=str(_d13), env=G.net_env())
 
-_ig = G.ignored_top_dirs(_d13)
+_ig = G.ignored_dirs(_d13)
 check("真的被排除的目录都列出来了", set(_ig) == {".cache/", "dist/"}, f"-> {_ig}")
 check("⭐ 没被排除的 build/ 不许出现在「已排除」名单里（回归：原来会误报）",
       "build/" not in _ig, f"-> {_ig}")
 check("没被排除的 src/ 也不出现", "src/" not in _ig, f"-> {_ig}")
-check("结果稳定可重复（连调两次一致）", G.ignored_top_dirs(_d13) == _ig)
+check("结果稳定可重复（连调两次一致）", G.ignored_dirs(_d13) == _ig)
 
 # 反向对照：把 .gitignore 换成不排除 dist/，它就该消失 —— 证明确实是读规则
 (_d13 / ".gitignore").write_text(".cache/\n", encoding="utf-8")
 check("改 .gitignore 后 dist/ 立刻从名单消失（读的是规则，不是名字）",
-      G.ignored_top_dirs(_d13) == [".cache/"], f"-> {G.ignored_top_dirs(_d13)}")
+      G.ignored_dirs(_d13) == [".cache/"], f"-> {G.ignored_dirs(_d13)}")
+
+# --------------------------------------------------------------------------
+# 13b) ⭐ 嵌套目录：2026-10-13 修。第一版虽然问对了 git，却把答案**截短**成顶层名
+#     （`split("/")[0]`），于是「只有子目录被排除」被报成「整个父目录被排除」。
+#     实测（drug-keeper）：.gitignore 排的是 tools/rx_local/__pycache__/，
+#     同一屏同时印着「已被 .gitignore 排除：tools/」和「将推送 15 项改动」
+#     （其中就有 tools/rx_local/rx_local.py）——**两行自相矛盾**。
+# --------------------------------------------------------------------------
+_d13b = BASE / "igdirs-nested"
+(_d13b / "tools" / "rx_local" / "__pycache__").mkdir(parents=True)
+(_d13b / "tools" / "rx_local" / "rx_local.py").write_text("print(1)\n", encoding="utf-8")
+(_d13b / "tools" / "rx_local" / "__pycache__" / "x.pyc").write_text("junk\n", encoding="utf-8")
+(_d13b / "top").mkdir()
+(_d13b / "top" / "a.txt").write_text("keep\n", encoding="utf-8")
+(_d13b / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+for _c in (["git", "init", "-b", "main", "-q"],
+           ["git", "config", "user.name", "T"],
+           ["git", "config", "user.email", "t@e.com"],
+           ["git", "add", "-A"],
+           ["git", "commit", "-q", "-m", "first"]):
+    sh(_c, cwd=str(_d13b), env=G.net_env())
+
+_igb = G.ignored_dirs(_d13b)
+check("嵌套被排除的目录报的是它自己的路径，不是祖先名",
+      _igb == ["tools/rx_local/__pycache__/"], f"-> {_igb}")
+check("⭐ 父目录 tools/ 不许被说成「已排除」（回归：原来会报成 tools/）",
+      "tools/" not in _igb, f"-> {_igb}")
+check("没被排除的 top/ 也不出现", "top/" not in _igb, f"-> {_igb}")
 
 # 没有 .gitignore 的仓库：一个都不该出现
 _d14 = BASE / "igdirs2"
@@ -614,7 +642,7 @@ for _c in (["git", "init", "-b", "main", "-q"],
            ["git", "commit", "-q", "-m", "first"]):
     sh(_c, cwd=str(_d14), env=G.net_env())
 check("无 .gitignore 时名单为空（不凭空报「已排除」）",
-      G.ignored_top_dirs(_d14) == [], f"-> {G.ignored_top_dirs(_d14)}")
+      G.ignored_dirs(_d14) == [], f"-> {G.ignored_dirs(_d14)}")
 
 print()
 print("=" * 60)
